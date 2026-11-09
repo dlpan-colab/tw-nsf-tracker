@@ -1,19 +1,20 @@
 """
 模組名稱：app.py
-版本識別：20261109_2258
+版本識別：20261109_2310
 修改目的：
-1. 更新版本識別為 20261109_2258。
-2. 表格欄位名稱修正：「股票代號」改為「代號」，「股票名稱」改為「名稱」。
-3. 嚴格欄位排序：張數位於金額之前：['名次', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '買賣超金額(萬元)']。
-4. 買賣超前 20 名排序與空值防呆：
-   - 買超前 20 名：依金額降冪排序（正值最大排第 1 名）。
-   - 賣超前 20 名：依金額升冪排序（負值最深賣超最多排第 1 名）。
+1. 更新版本識別為 20261109_2310。
+2. 表格移除「名次」欄位，釋出水平顯示寬度。
+3. 「買賣超金額(萬元)」更名為「金額(萬元)」。
+4. 欄位順序嚴格對齊：['代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']（張數維持在金額之前）。
+5. 買賣超前 20 名排序與空值防呆：
+   - 買超前 20 名：依金額降冪排序（正值最大排首位）。
+   - 賣超前 20 名：依金額升冪排序（負值最深賣超最多排首位）。
    - 當日查無真實資料或休市時，直接提示「無官方交易數據」，不偽造資料。
 防呆防錯原因：
 1. 資料為空時以 st.info 顯示，杜絕表格切片或分頁引發 KeyError / IndexError。
 """
 
-MODULE_VERSION = "20261109_2258"
+MODULE_VERSION = "20261109_2310"
 
 import streamlit as st
 import datetime
@@ -178,7 +179,7 @@ with col_sel_bank:
 
 single_day_df = fetch_gov_branch_trades(focus_date.strftime("%Y-%m-%d"))
 
-DISPLAY_COLS = ["名次", "代號", "名稱", "買進張數", "賣出張數", "買賣超張數", "買賣超金額(萬元)"]
+DISPLAY_COLS = ["代號", "名稱", "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"]
 
 if single_day_df.empty:
     st.info(f"{focus_date.strftime('%Y-%m-%d')} 尚無官方公布之八大官股買賣超排行紀錄（可能逢假日休市或盤後數據尚未產出）。")
@@ -190,18 +191,15 @@ else:
             "買進張數": "sum",
             "賣出張數": "sum",
             "買賣超張數": "sum",
-            "買賣超金額(萬元)": "sum"
+            "金額(萬元)": "sum"
         })
 
     # 嚴格依金額排序：買超正值降冪；賣超負值升冪
-    buy_pool = day_target_df[day_target_df["買賣超金額(萬元)"] > 0].copy()
-    sell_pool = day_target_df[day_target_df["買賣超金額(萬元)"] < 0].copy()
+    buy_pool = day_target_df[day_target_df["金額(萬元)"] > 0].copy()
+    sell_pool = day_target_df[day_target_df["金額(萬元)"] < 0].copy()
 
-    top_buy_20 = buy_pool.sort_values(by="買賣超金額(萬元)", ascending=False).head(20).reset_index(drop=True)
-    top_buy_20.insert(0, "名次", range(1, len(top_buy_20) + 1))
-
-    top_sell_20 = sell_pool.sort_values(by="買賣超金額(萬元)", ascending=True).head(20).reset_index(drop=True)
-    top_sell_20.insert(0, "名次", range(1, len(top_sell_20) + 1))
+    top_buy_20 = buy_pool.sort_values(by="金額(萬元)", ascending=False).head(20).reset_index(drop=True)
+    top_sell_20 = sell_pool.sort_values(by="金額(萬元)", ascending=True).head(20).reset_index(drop=True)
 
     tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
 

@@ -1,17 +1,19 @@
 """
 模組名稱：app.py
-版本識別：20261109_2245
+版本識別：20261109_2258
 修改目的：
-1. 更新版本識別為 20261109_2245。
-2. 買超前 20 名與賣超前 20 名嚴格排序修訂：
-   - 買超前 20 名：依「買賣超金額(萬元)」由大至小嚴格降冪排列（正數最大居首）。
-   - 賣超前 20 名：依「買賣超金額(萬元)」由負值最深至小嚴格升冪排列（賣超最大居首）。
-3. 頁面標頭即時統計前 20 名合計買超與賣超金額。
+1. 更新版本識別為 20261109_2258。
+2. 表格欄位名稱修正：「股票代號」改為「代號」，「股票名稱」改為「名稱」。
+3. 嚴格欄位排序：張數位於金額之前：['名次', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '買賣超金額(萬元)']。
+4. 買賣超前 20 名排序與空值防呆：
+   - 買超前 20 名：依金額降冪排序（正值最大排第 1 名）。
+   - 賣超前 20 名：依金額升冪排序（負值最深賣超最多排第 1 名）。
+   - 當日查無真實資料或休市時，直接提示「無官方交易數據」，不偽造資料。
 防呆防錯原因：
-1. 針對多空分頁，買超只篩選大於 0 的正向標的；賣超只篩選小於 0 的負向標的，切片前 20 筆杜絕空檔交錯。
+1. 資料為空時以 st.info 顯示，杜絕表格切片或分頁引發 KeyError / IndexError。
 """
 
-MODULE_VERSION = "20261109_2245"
+MODULE_VERSION = "20261109_2258"
 
 import streamlit as st
 import datetime
@@ -30,7 +32,6 @@ from data_loader import (
 from chart_builder import build_taiex_chart
 from frontend import render_interactive_chart
 
-# 提取最大版本識別
 all_versions = [
     getattr(data_loader, "MODULE_VERSION", "0"),
     getattr(chart_builder, "MODULE_VERSION", "0"),
@@ -177,32 +178,46 @@ with col_sel_bank:
 
 single_day_df = fetch_gov_branch_trades(focus_date.strftime("%Y-%m-%d"))
 
-if selected_bank != "全部官股合計":
-    day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
+DISPLAY_COLS = ["名次", "代號", "名稱", "買進張數", "賣出張數", "買賣超張數", "買賣超金額(萬元)"]
+
+if single_day_df.empty:
+    st.info(f"{focus_date.strftime('%Y-%m-%d')} 尚無官方公布之八大官股買賣超排行紀錄（可能逢假日休市或盤後數據尚未產出）。")
 else:
-    day_target_df = single_day_df.groupby(["股票代號", "股票名稱"], as_index=False).agg({
-        "買進張數": "sum",
-        "賣出張數": "sum",
-        "買賣超張數": "sum",
-        "買賣超金額(萬元)": "sum"
-    })
+    if selected_bank != "全部官股合計":
+        day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
+    else:
+        day_target_df = single_day_df.groupby(["代號", "名稱"], as_index=False).agg({
+            "買進張數": "sum",
+            "賣出張數": "sum",
+            "買賣超張數": "sum",
+            "買賣超金額(萬元)": "sum"
+        })
 
-# 嚴格排序邏輯：買超正值降冪；賣超負值升冪
-buy_pool = day_target_df[day_target_df["買賣超金額(萬元)"] > 0]
-sell_pool = day_target_df[day_target_df["買賣超金額(萬元)"] < 0]
+    # 嚴格依金額排序：買超正值降冪；賣超負值升冪
+    buy_pool = day_target_df[day_target_df["買賣超金額(萬元)"] > 0].copy()
+    sell_pool = day_target_df[day_target_df["買賣超金額(萬元)"] < 0].copy()
 
-top_buy_20 = buy_pool.sort_values(by="買賣超金額(萬元)", ascending=False).head(20).reset_index(drop=True)
-top_sell_20 = sell_pool.sort_values(by="買賣超金額(萬元)", ascending=True).head(20).reset_index(drop=True)
+    top_buy_20 = buy_pool.sort_values(by="買賣超金額(萬元)", ascending=False).head(20).reset_index(drop=True)
+    top_buy_20.insert(0, "名次", range(1, len(top_buy_20) + 1))
 
-tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
+    top_sell_20 = sell_pool.sort_values(by="買賣超金額(萬元)", ascending=True).head(20).reset_index(drop=True)
+    top_sell_20.insert(0, "名次", range(1, len(top_sell_20) + 1))
 
-with tab_buy:
-    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名標的（正值最大在前）：**")
-    st.dataframe(top_buy_20, use_container_width=True, hide_index=True)
+    tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
 
-with tab_sell:
-    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名標的（賣超最多在前）：**")
-    st.dataframe(top_sell_20, use_container_width=True, hide_index=True)
+    with tab_buy:
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名：**")
+        if not top_buy_20.empty:
+            st.dataframe(top_buy_20[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        else:
+            st.info("當日無官股買超標的紀錄。")
+
+    with tab_sell:
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名：**")
+        if not top_sell_20.empty:
+            st.dataframe(top_sell_20[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        else:
+            st.info("當日無官股賣超標的紀錄。")
 
 st.markdown("---")
 
@@ -225,29 +240,32 @@ range_summary_df = fetch_range_gov_branch_summary(
     stat_end.strftime("%Y-%m-%d")
 )
 
-tab1, tab2 = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
+if range_summary_df.empty:
+    st.info("所選統計區間內查無官股進出紀錄。")
+else:
+    tab1, tab2 = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
 
-with tab1:
-    st.markdown("**各官股分點於所選區間買賣各個股明細（買賣超張數）：**")
-    pivot_branch = pd.pivot_table(
-        range_summary_df,
-        values="買賣超張數",
-        index=["官股分點"],
-        columns=["股票名稱"],
-        aggfunc="sum",
-        fill_value=0
-    )
-    st.dataframe(pivot_branch, use_container_width=True)
+    with tab1:
+        st.markdown("**各官股分點於所選區間買賣各個股明細（買賣超張數）：**")
+        pivot_branch = pd.pivot_table(
+            range_summary_df,
+            values="買賣超張數",
+            index=["官股分點"],
+            columns=["名稱"],
+            aggfunc="sum",
+            fill_value=0
+        )
+        st.dataframe(pivot_branch, use_container_width=True)
 
-with tab2:
-    st.markdown("**市場核心個股在八大官股分點之買賣超張數彙總：**")
-    pivot_stock = pd.pivot_table(
-        range_summary_df,
-        values="買賣超張數",
-        index=["股票代號", "股票名稱"],
-        columns=["官股分點"],
-        aggfunc="sum",
-        fill_value=0
-    )
-    pivot_stock["合計買賣超(張)"] = pivot_stock.sum(axis=1)
-    st.dataframe(pivot_stock.sort_values(by="合計買賣超(張)", ascending=False), use_container_width=True)
+    with tab2:
+        st.markdown("**市場核心個股在八大官股分點之買賣超張數彙總：**")
+        pivot_stock = pd.pivot_table(
+            range_summary_df,
+            values="買賣超張數",
+            index=["代號", "名稱"],
+            columns=["官股分點"],
+            aggfunc="sum",
+            fill_value=0
+        )
+        pivot_stock["合計買賣超(張)"] = pivot_stock.sum(axis=1)
+        st.dataframe(pivot_stock.sort_values(by="合計買賣超(張)", ascending=False), use_container_width=True)

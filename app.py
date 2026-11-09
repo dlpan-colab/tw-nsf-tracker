@@ -1,16 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261109_1525
+版本識別：20261109_1535
 修改目的：
-1. 更新版本識別為 20261109_1525，頂部呈現系統最大版本號。
-2. 保持調用 frontend.render_interactive_chart 進行原生 HTML/JS 渲染。
+1. 更新版本識別為 20261109_1535，頂部呈現系統最大版本號。
+2. 調用 frontend.render_interactive_chart 進行圖表與固定資訊條之整合渲染。
 3. 政策事件功能鍵在手機端嚴格維持同列橫排。
 4. 系統名稱字體維持與次標題同級。
 防呆防錯原因：
-1. 保證事件跳轉定位與圖表索引無縫對接。
+1. 確保模組版本號聯動更新，維持專案追蹤一致性。
 """
 
-MODULE_VERSION = "20261109_1525"
+MODULE_VERSION = "20261109_1535"
 
 import streamlit as st
 import datetime
@@ -161,7 +161,7 @@ chart_fig = build_taiex_chart(
     display_bars=display_days,
     target_date_idx=st.session_state.focus_target_idx
 )
-render_interactive_chart(chart_fig, height=720)
+render_interactive_chart(chart_fig, height=740)
 
 st.markdown("---")
 

@@ -1,15 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261109_2235
+版本識別：20261109_2238
 修改目的：
-1. 更新版本識別為 20261109_2235。
-2. 預設起日調整為 2000-01-01，確保完整歷史資料足以計算 1200MA（五年線）與 2400MA（十年線）。
-3. 整合 cloud_sync 模組識別，確保系統最大版本號正確回報。
+1. 更新版本識別為 20261109_2238。
+2. 【指定交易日】分點進出明細全面升級為「買超前 20 名」與「賣超前 20 名」分頁檢視，不再受限於固定 8 檔。
+3. 表格格式清楚標註張數與金額（萬元），支援全官股合計與單一分點篩選。
 防呆防錯原因：
-1. 確保跨模組版本號一致性維護。
+1. 針對多空排名切片時，買超取 head(20)，賣超取 tail(20) 並反轉排列，確保負值由大至小直觀呈現。
+2. 若篩選分點當日交易檔數不足 20 檔，自然呈現實際檔數，不發生 IndexError。
 """
 
-MODULE_VERSION = "20261109_2235"
+MODULE_VERSION = "20261109_2238"
 
 import streamlit as st
 import datetime
@@ -78,7 +79,6 @@ display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_val
 
 st.sidebar.markdown("---")
 st.sidebar.header("大盤行情載入區間")
-# 起日預設為 2000-01-01，滿足十年線（2400MA）計算跨度
 start_default = datetime.date(2000, 1, 1)
 end_default = datetime.date.today()
 
@@ -165,8 +165,8 @@ render_interactive_chart(chart_fig, taiex_df, height=580)
 
 st.markdown("---")
 
-# 5. 指定交易日官股分點檢視
-st.subheader("【指定交易日】分點進出明細")
+# 5. 指定交易日官股分點檢視（買超前 20 名 / 賣超前 20 名）
+st.subheader("【指定交易日】八大官股分點買賣超標的排名")
 
 col_sel_date, col_sel_bank = st.columns(2)
 with col_sel_date:
@@ -177,20 +177,29 @@ with col_sel_bank:
 single_day_df = fetch_gov_branch_trades(focus_date.strftime("%Y-%m-%d"))
 
 if selected_bank != "全部官股合計":
-    filtered_day_df = single_day_df[single_day_df["官股分點"] == selected_bank]
+    day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
 else:
-    filtered_day_df = single_day_df.groupby(["股票代號", "股票名稱"], as_index=False).agg({
+    day_target_df = single_day_df.groupby(["股票代號", "股票名稱"], as_index=False).agg({
         "買進張數": "sum",
         "賣出張數": "sum",
         "買賣超張數": "sum",
         "買賣超金額(萬元)": "sum"
     })
 
-st.dataframe(
-    filtered_day_df.sort_values(by="買賣超金額(萬元)", ascending=False),
-    use_container_width=True,
-    hide_index=True
-)
+# 排序並切片前 20 名
+sorted_by_amount = day_target_df.sort_values(by="買賣超金額(萬元)", ascending=False)
+top_buy_20 = sorted_by_amount.head(20).reset_index(drop=True)
+top_sell_20 = sorted_by_amount.tail(20).sort_values(by="買賣超金額(萬元)", ascending=True).reset_index(drop=True)
+
+tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
+
+with tab_buy:
+    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名標的：**")
+    st.dataframe(top_buy_20, use_container_width=True, hide_index=True)
+
+with tab_sell:
+    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名標的：**")
+    st.dataframe(top_sell_20, use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
@@ -228,7 +237,7 @@ with tab1:
     st.dataframe(pivot_branch, use_container_width=True)
 
 with tab2:
-    st.markdown("**各核心個股在八大官股分點之買賣超張數彙總：**")
+    st.markdown("**市場核心個股在八大官股分點之買賣超張數彙總：**")
     pivot_stock = pd.pivot_table(
         range_summary_df,
         values="買賣超張數",

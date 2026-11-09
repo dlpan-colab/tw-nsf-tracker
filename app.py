@@ -1,20 +1,19 @@
 """
 模組名稱：app.py
-版本識別：20261109_2310
+版本識別：20261109_2315
 修改目的：
-1. 更新版本識別為 20261109_2310。
-2. 表格移除「名次」欄位，釋出水平顯示寬度。
-3. 「買賣超金額(萬元)」更名為「金額(萬元)」。
-4. 欄位順序嚴格對齊：['代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']（張數維持在金額之前）。
-5. 買賣超前 20 名排序與空值防呆：
-   - 買超前 20 名：依金額降冪排序（正值最大排首位）。
-   - 賣超前 20 名：依金額升冪排序（負值最深賣超最多排首位）。
+1. 更新版本識別為 20261109_2315。
+2. 買賣超排名由前 20 名擴展為前 30 名。
+3. 表格無「名次」欄位，維持欄位順序：['代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+4. 買賣超前 30 名排序與空值防呆：
+   - 買超前 30 名：依金額降冪排序（正值最大排首位）。
+   - 賣超前 30 名：依金額升冪排序（負值最深賣超最多排首位）。
    - 當日查無真實資料或休市時，直接提示「無官方交易數據」，不偽造資料。
 防呆防錯原因：
 1. 資料為空時以 st.info 顯示，杜絕表格切片或分頁引發 KeyError / IndexError。
 """
 
-MODULE_VERSION = "20261109_2310"
+MODULE_VERSION = "20261109_2315"
 
 import streamlit as st
 import datetime
@@ -168,7 +167,7 @@ render_interactive_chart(chart_fig, taiex_df, height=580)
 
 st.markdown("---")
 
-# 5. 指定交易日官股分點檢視（買超前 20 名 / 賣超前 20 名）
+# 5. 指定交易日官股分點檢視（買超前 30 名 / 賣超前 30 名）
 st.subheader("【指定交易日】八大官股分點買賣超標的排名")
 
 col_sel_date, col_sel_bank = st.columns(2)
@@ -198,22 +197,22 @@ else:
     buy_pool = day_target_df[day_target_df["金額(萬元)"] > 0].copy()
     sell_pool = day_target_df[day_target_df["金額(萬元)"] < 0].copy()
 
-    top_buy_20 = buy_pool.sort_values(by="金額(萬元)", ascending=False).head(20).reset_index(drop=True)
-    top_sell_20 = sell_pool.sort_values(by="金額(萬元)", ascending=True).head(20).reset_index(drop=True)
+    top_buy_30 = buy_pool.sort_values(by="金額(萬元)", ascending=False).head(30).reset_index(drop=True)
+    top_sell_30 = sell_pool.sort_values(by="金額(萬元)", ascending=True).head(30).reset_index(drop=True)
 
-    tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
+    tab_buy, tab_sell = st.tabs(["🟢 官股買超前 30 名", "🔴 官股賣超前 30 名"])
 
     with tab_buy:
-        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名：**")
-        if not top_buy_20.empty:
-            st.dataframe(top_buy_20[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 30 名：**")
+        if not top_buy_30.empty:
+            st.dataframe(top_buy_30[DISPLAY_COLS], use_container_width=True, hide_index=True)
         else:
             st.info("當日無官股買超標的紀錄。")
 
     with tab_sell:
-        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名：**")
-        if not top_sell_20.empty:
-            st.dataframe(top_sell_20[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 30 名：**")
+        if not top_sell_30.empty:
+            st.dataframe(top_sell_30[DISPLAY_COLS], use_container_width=True, hide_index=True)
         else:
             st.info("當日無官股賣超標的紀錄。")
 

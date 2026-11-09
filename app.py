@@ -1,12 +1,12 @@
 """
 模組名稱：app.py
 修改目的：
-1. 支援預設 30 日（可滑桿調整）K 線可視視圖。
-2. 新增 4 組政策事件「上一個／下一個」快速跳轉按鈕（國安基金進場/退場、限空令實施/解除）。
-3. 保持單日各分點檢視與區間進出統計功能完整。
+1. 解決按鈕未同列排版問題：將「事件標題」、「上一個」、「下一個」配置在單一行內（避免嵌套多層 columns 導致手機窄螢幕折行）。
+2. 維護 4 類政策事件游標切換，並與加權指數圖表連動。
+3. 保持單日各分點明細與區間進出統計功能完整。
 防呆防錯原因：
-1. 使用 Streamlit session_state 保留當前錨定之事件索引，按鈕觸發時進行邊界檢查（索引不小於 0 且不大於清單長度），避免 IndexOutOfRange。
-2. 跳轉時自動將關注交易日連動為該事件日，避免圖表與下方表格日期脫鉤。
+1. 使用 Streamlit session_state 保留事件索引，加入邊界值檢查（不小於 0 且不超過清單長度）。
+2. 當點選跳轉事件時，若該日為非交易日（如週末發布），自動對齊至最近之交易日，避免 KeyError。
 """
 
 import streamlit as st
@@ -23,18 +23,17 @@ from chart_builder import build_taiex_chart
 
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# 1. 初始化 Session State 狀態（防呆維護當前視角與事件索引）
+# 1. 初始化 Session State 狀態
 if "focus_target_idx" not in st.session_state:
-    st.session_state.focus_target_idx = None  # None 代表預設最新資料
+    st.session_state.focus_target_idx = None
 if "focus_date_val" not in st.session_state:
     st.session_state.focus_date_val = datetime.date.today()
 
-# 儲存 4 類事件的當前遊標索引
 for key in ["idx_NSF_AUTH", "idx_NSF_EXIT", "idx_SHORT_RESTRICT", "idx_SHORT_LIFT"]:
     if key not in st.session_state:
         st.session_state[key] = -1
 
-# 側邊欄：顯示天數與整體數據加載範圍
+# 側邊欄設定
 st.sidebar.header("圖表顯示設定")
 display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_value=120, value=30, step=5)
 
@@ -60,12 +59,11 @@ if taiex_df.empty:
     st.error("加權指數資料取得為空，請檢查網路連線或日期區間。")
     st.stop()
 
-# 日期與索引對照對齊字典（防呆查詢）
 date_to_idx = {row["Date"]: idx for idx, row in taiex_df.iterrows()}
 
 st.title("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
-# 3. 政策事件跳轉按鈕工具列
+# 3. 政策事件快速跳轉控制區（單行並排排版，避免手機螢幕破版）
 st.subheader("政策事件快速定位")
 
 def jump_event(event_type: str, direction: int):
@@ -93,57 +91,63 @@ def jump_event(event_type: str, direction: int):
     st.session_state[state_key] = new_idx
     target_date = sub_df.iloc[new_idx]["Date"]
     
-    # 查找加權指數對應的行情索引
     if target_date in date_to_idx:
         st.session_state.focus_target_idx = date_to_idx[target_date]
         st.session_state.focus_date_val = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
     else:
-        # 防呆：若該事件日為非交易日（如週末公布），找其後最近的一個交易日
+        # 防呆：若該事件日為非交易日（如週末），對齊至最近的交易日
         future_dates = taiex_df[taiex_df["Date"] >= target_date]
         if not future_dates.empty:
             match_date = future_dates.iloc[0]["Date"]
             st.session_state.focus_target_idx = date_to_idx[match_date]
             st.session_state.focus_date_val = datetime.datetime.strptime(match_date, "%Y-%m-%d").date()
 
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
+# 採用每組 3 個欄位（名稱, 上一個, 下一個）單行橫向並排
+r1_c1, r1_c2, r1_c3 = st.columns([2, 1, 1])
+with r1_c1:
     st.markdown("**:red[國安基金進場 (▲)]**")
-    b1, b2 = st.columns(2)
-    if b1.button("上一個", key="prev_nsf_auth"):
+with r1_c2:
+    if st.button("上一個", key="prev_nsf_auth", use_container_width=True):
         jump_event("NSF_AUTH", -1)
-    if b2.button("下一個", key="next_nsf_auth"):
+with r1_c3:
+    if st.button("下一個", key="next_nsf_auth", use_container_width=True):
         jump_event("NSF_AUTH", 1)
 
-with c2:
+r2_c1, r2_c2, r2_c3 = st.columns([2, 1, 1])
+with r2_c1:
     st.markdown("**:green[國安基金退場 (▼)]**")
-    b3, b4 = st.columns(2)
-    if b3.button("上一個", key="prev_nsf_exit"):
+with r2_c2:
+    if st.button("上一個", key="prev_nsf_exit", use_container_width=True):
         jump_event("NSF_EXIT", -1)
-    if b4.button("下一個", key="next_nsf_exit"):
+with r2_c3:
+    if st.button("下一個", key="next_nsf_exit", use_container_width=True):
         jump_event("NSF_EXIT", 1)
 
-with c3:
+r3_c1, r3_c2, r3_c3 = st.columns([2, 1, 1])
+with r3_c1:
     st.markdown("**:orange[金管會限空令 (▲)]**")
-    b5, b6 = st.columns(2)
-    if b5.button("上一個", key="prev_short_r"):
+with r3_c2:
+    if st.button("上一個", key="prev_short_r", use_container_width=True):
         jump_event("SHORT_RESTRICT", -1)
-    if b6.button("下一個", key="next_short_r"):
+with r3_c3:
+    if st.button("下一個", key="next_short_r", use_container_width=True):
         jump_event("SHORT_RESTRICT", 1)
 
-with c4:
+r4_c1, r4_c2, r4_c3 = st.columns([2, 1, 1])
+with r4_c1:
     st.markdown("**:blue[限空令解除 (▼)]**")
-    b7, b8 = st.columns(2)
-    if b7.button("上一個", key="prev_short_l"):
+with r4_c2:
+    if st.button("上一個", key="prev_short_l", use_container_width=True):
         jump_event("SHORT_LIFT", -1)
-    if b8.button("下一個", key="next_short_l"):
+with r4_c3:
+    if st.button("下一個", key="next_short_l", use_container_width=True):
         jump_event("SHORT_LIFT", 1)
 
-if st.button("重設回最新交易日視圖"):
+if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（鎖定 Y 軸、動態自適應極值、X 軸右邊界對齊）
+# 4. 繪製圖表
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
@@ -155,7 +159,7 @@ st.plotly_chart(chart_fig, use_container_width=True)
 st.markdown("---")
 
 # 5. 指定交易日官股分點檢視
-st.subheader(f"【指定交易日】分點進出明細")
+st.subheader("【指定交易日】分點進出明細")
 
 col_sel_date, col_sel_bank = st.columns(2)
 with col_sel_date:

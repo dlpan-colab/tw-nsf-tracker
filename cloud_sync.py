@@ -1,6 +1,6 @@
 """
 模組名稱：cloud_sync.py
-版本識別：20261109_2235
+版本識別：20261109_2238
 修改目的：
 1. 透過 Streamlit Secrets 讀取服務帳戶憑證與 folder_id。
 2. 建立 Google Drive 雲端檔案同步機制（下載歷史快取至本機、將更新後的快取上傳至雲端硬碟 NSF-tracker 資料夾）。
@@ -9,7 +9,7 @@
 2. 使用 BytesIO 緩衝區串流傳輸，避免本機暫存檔殘留或鎖定衝突。
 """
 
-MODULE_VERSION = "20261109_2235"
+MODULE_VERSION = "20261109_2238"
 
 import io
 import json

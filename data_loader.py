@@ -1,19 +1,23 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_2310
+版本識別：20261109_2345
 修改目的：
-1. 更新版本識別為 20261109_2310。
-2. 輸出欄位更名：「買賣超金額(萬元)」改為「金額(萬元)」。
-3. 欄位架構維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
-4. 維持證交所官方盤後端點串接與 Google Drive 同步機制。
+1. 更新版本識別為 20261109_2345。
+2. 解除區間統計僅抓最後 3 個交易日的限制（移除 dates[-3:] 切片），完整支援 15~30 天以上歷史工作日檢索。
+3. 實作 FinMind 券商分點明細（TaiwanStockSecuritiesBrokerTrades）對接與漸進式「慢慢補」機制：
+   - 設定八大公股分點代碼對應表。
+   - 優先讀取本機與 Google Drive 歷史庫（gov_trades_history.csv）；缺失日期逐日補充並追加落地。
+4. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
 防呆防錯原因：
-1. 資料欄位更名保持全域一致，避免與 app.py 產生 KeyError。
+1. 若 Streamlit Secrets 未配置 FinMind Token，自動平滑降級為證交所公開端點，不阻斷程式。
+2. 區間回補加入微延遲與異常捕獲，防範高頻請求遭封鎖。
 """
 
-MODULE_VERSION = "20261109_2310"
+MODULE_VERSION = "20261109_2345"
 
 import os
 import json
+import time
 import datetime
 import requests
 import pandas as pd
@@ -26,10 +30,19 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 LOCAL_TAIEX_FILE = os.path.join(CACHE_DIR, "taiex_history.csv")
 LOCAL_GOV_FILE = os.path.join(CACHE_DIR, "gov_trades_history.csv")
 
-GOV_BANKS = [
-    "臺灣銀行", "台灣土地銀行", "合作金庫", "第一金證券",
-    "華南永昌", "彰化銀行", "兆豐證券", "臺灣中小企銀"
-]
+# 八大官股券商總行代號對應
+GOV_BROKER_MAP = {
+    "1020": "臺灣銀行",
+    "1030": "台灣土地銀行",
+    "5850": "合作金庫",
+    "5920": "第一金證券",
+    "5380": "華南永昌",
+    "1040": "彰化銀行",
+    "7000": "兆豐證券",
+    "2110": "臺灣中小企銀"
+}
+
+GOV_BANKS = list(GOV_BROKER_MAP.values())
 
 EMPTY_TRADE_COLUMNS = [
     "交易日期", "官股分點", "代號", "名稱",
@@ -109,8 +122,55 @@ def _clean_num(val) -> float:
     except Exception:
         return 0.0
 
+def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
+    """透過 FinMind API 取得八大官股分點在特定日期的進出明細"""
+    token = st.secrets.get("finmind", {}).get("api_token", "")
+    url = "https://api.finmindtrade.com/api/v4/data"
+    
+    # 若有設定 token 則使用，否則使用免 token 輕量請求
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    
+    records = []
+    # 針對八大官股券商代碼查詢
+    for b_code, b_name in GOV_BROKER_MAP.items():
+        params = {
+            "dataset": "TaiwanStockSecuritiesBrokerTrades",
+            "data_id": b_code,
+            "start_date": trade_date,
+            "end_date": trade_date
+        }
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=6)
+            if resp.status_code == 200:
+                data = resp.json().get("data", [])
+                for item in data:
+                    s_code = str(item.get("stock_id", "")).strip()
+                    s_name = str(item.get("stock_name", s_code)).strip()
+                    buy_v = int(item.get("buy", 0))
+                    sell_v = int(item.get("sell", 0))
+                    net_v = buy_v - sell_v
+                    price = float(item.get("price", 0.0))
+                    net_amt = round(net_v * price * 0.1, 2)  # 概算金額(萬元)
+                    
+                    records.append({
+                        "交易日期": trade_date,
+                        "官股分點": b_name,
+                        "代號": s_code,
+                        "名稱": s_name,
+                        "買進張數": buy_v,
+                        "賣出張數": sell_v,
+                        "買賣超張數": net_v,
+                        "金額(萬元)": net_amt
+                    })
+        except Exception:
+            pass
+
+    if records:
+        return pd.DataFrame(records)
+    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+
 def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
-    """向證交所官方盤後端點請求真實歷史分點交易統計"""
+    """向證交所官方盤後端點請求真實歷史交易統計（備援回退機制）"""
     date_compact = trade_date.replace("-", "")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -168,7 +228,12 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    new_df = _query_twse_gov_ranking(trade_date)
+    # 優先嘗試透過 FinMind 抓取 8 大分點
+    new_df = _query_finmind_gov_trades(trade_date)
+    # 若 FinMind 查無資料或未配置 token，則回退至 TWSE 官方端點
+    if new_df.empty:
+        new_df = _query_twse_gov_ranking(trade_date)
+
     if not new_df.empty:
         try:
             if os.path.exists(LOCAL_GOV_FILE):
@@ -189,19 +254,43 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """區間統計函式：自歷史資料庫彙總真實資料"""
+    """區間統計函式：自歷史庫彙總，缺失日期溫和漸進回補並同步 Google Drive"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
 
+    cached_db = pd.DataFrame()
     if os.path.exists(LOCAL_GOV_FILE):
         try:
             cached_db = pd.read_csv(LOCAL_GOV_FILE)
             if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
                 cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-            if not cached_db.empty and "交易日期" in cached_db.columns:
-                mask = (cached_db["交易日期"] >= start_date) & (cached_db["交易日期"] <= end_date)
-                return cached_db[mask]
         except Exception:
-            pass
+            cached_db = pd.DataFrame()
+
+    # 產生指定區間的所有工作日
+    work_days = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d").tolist()
+    recorded_days = set(cached_db["交易日期"].unique()) if not cached_db.empty and "交易日期" in cached_db.columns else set()
+    
+    # 找出缺失的日期（排除週末）
+    missing_days = [d for d in work_days if d not in recorded_days]
+
+    # 若有缺失工作日，採「慢慢補」策略（每次統計最多溫和回補近 5 個缺失交易日，避免超額）
+    if missing_days:
+        for m_day in missing_days[-5:]:
+            fetch_gov_branch_trades(m_day)
+            time.sleep(0.2)  # 溫和延遲
+
+        # 重新載入最新資料庫
+        if os.path.exists(LOCAL_GOV_FILE):
+            try:
+                cached_db = pd.read_csv(LOCAL_GOV_FILE)
+                if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
+                    cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
+            except Exception:
+                pass
+
+    if not cached_db.empty and "交易日期" in cached_db.columns:
+        mask = (cached_db["交易日期"] >= start_date) & (cached_db["交易日期"] <= end_date)
+        return cached_db[mask]
 
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)

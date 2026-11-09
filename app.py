@@ -1,17 +1,19 @@
 """
 模組名稱：app.py
-版本識別：20261109_2350
+版本識別：20261110_0005
 修改目的：
-1. 更新版本識別為 20261109_2350。
-2. 個股穿透視圖升級：
-   - 保留「全部官股合計」全幅走勢圖。
-   - 篩選排除全部官股合計後的實體分點，依絕對值取前 5 大主力分點，逐一繪製每日買賣超柱狀圖。
-3. 維持買賣超前 30 名、無名次欄位、張數在金額之前等既有設定。
+1. 更新版本識別為 20261110_0005。
+2. 個股穿透檢視下拉選單排序調整：
+   - 先排序買超個股：合計買超張數 > 0，依絕對值由大到小排序（買超最大居首位）。
+   - 再排序賣超個股：合計賣超張數 < 0，依絕對值由小到大排序（賣超最少至賣超最多）。
+   - 兩者依序串接為下拉選單選項，並標記累計買賣超張數。
+3. 維持「全部官股合計」全幅走勢圖與 5 大主力實體分點每日買賣超柱狀圖。
+4. 維持買賣超前 30 名、無名次欄位、張數在金額之前等既有設定。
 防呆防錯原因：
-1. 若歷史庫尚未補足實體分點明細，以 st.info 友善提示「實質券商分點明細漸進回補中」，避免圖表報錯。
+1. 若個股合計為 0 或無符合條件之標的，以 drop_duplicates 原生清單為備援，避免 IndexError。
 """
 
-MODULE_VERSION = "20261109_2350"
+MODULE_VERSION = "20261110_0005"
 
 import streamlit as st
 import datetime
@@ -288,11 +290,29 @@ else:
         st.markdown("---")
         st.markdown("#### 🔍 個股穿透檢視：官股合計與五大主力分點每日進出走勢")
 
-        # 彙整所有出現過的個股代號與名稱作為下拉選單
-        available_stocks = range_summary_df[["代號", "名稱"]].drop_duplicates().sort_values("代號")
-        stock_options = [f"{r['代號']} {r['名稱']}" for _, r in available_stocks.iterrows()]
+        # 彙總各標的之全區間官股買賣超總計，進行雙向排序
+        stock_summary = range_summary_df.groupby(["代號", "名稱"], as_index=False)["買賣超張數"].sum()
 
-        if stock_options:
+        # 1. 買超個股：買賣超張數 > 0，依絕對值由大到小排序（買超最大居首位）
+        buy_sorted = stock_summary[stock_summary["買賣超張數"] > 0].copy()
+        buy_sorted["abs_vol"] = buy_sorted["買賣超張數"].abs()
+        buy_sorted = buy_sorted.sort_values(by="abs_vol", ascending=False)
+
+        # 2. 賣超個股：買賣超張數 < 0，依絕對值由小到大排序（賣超最少至賣超最多）
+        sell_sorted = stock_summary[stock_summary["買賣超張數"] < 0].copy()
+        sell_sorted["abs_vol"] = sell_sorted["買賣超張數"].abs()
+        sell_sorted = sell_sorted.sort_values(by="abs_vol", ascending=True)
+
+        # 串接選項清單（買超優先，其後為賣超，最後為無變動標的）
+        zero_sorted = stock_summary[stock_summary["買賣超張數"] == 0]
+        ordered_summary = pd.concat([buy_sorted, sell_sorted, zero_sorted], ignore_index=True)
+
+        if not ordered_summary.empty:
+            stock_options = [
+                f"{r['代號']} {r['名稱']} ({'+' if r['買賣超張數'] > 0 else ''}{int(r['買賣超張數']):,}張)"
+                for _, r in ordered_summary.iterrows()
+            ]
+
             selected_stock_label = st.selectbox("請選擇欲深入檢視的個股：", stock_options, index=0)
             selected_code = selected_stock_label.split()[0]
             selected_name = selected_stock_label.split()[1] if len(selected_stock_label.split()) > 1 else ""
@@ -303,7 +323,7 @@ else:
             # 1. 保留並呈現【全部官股合計】總覽柱狀圖
             total_stock_df = target_stock_df[target_stock_df["官股分點"] == "全部官股合計"].sort_values("交易日期")
             if not total_stock_df.empty:
-                st.markdown(f"**【{selected_stock_label}】 全部官股合計每日買賣超走勢：**")
+                st.markdown(f"**【{selected_code} {selected_name}】 全部官股合計每日買賣超走勢：**")
                 tot_colors = ["#E74C3C" if v >= 0 else "#2ECC71" for v in total_stock_df["買賣超張數"]]
                 fig_total = go.Figure(data=[
                     go.Bar(
@@ -329,7 +349,7 @@ else:
                 branch_activity = specific_branch_df.groupby("官股分點")["買賣超張數"].apply(lambda s: s.abs().sum()).sort_values(ascending=False)
                 top_5_branches = branch_activity.head(5).index.tolist()
 
-                st.markdown(f"**【{selected_stock_label}】 區間內最大買賣超 5 大實體分點每日走勢圖：**")
+                st.markdown(f"**【{selected_code} {selected_name}】 區間內最大買賣超 5 大實體分點每日走勢圖：**")
                 chart_cols = st.columns(min(len(top_5_branches), 3)) if top_5_branches else []
                 for i, branch_name in enumerate(top_5_branches):
                     col_target = chart_cols[i % len(chart_cols)]

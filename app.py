@@ -1,16 +1,15 @@
 """
 模組名稱：app.py
-版本識別：20261109_2155
+版本識別：20261109_2235
 修改目的：
-1. 更新版本識別為 20261109_2155，頂部呈現系統最大版本號。
-2. 傳入 taiex_df 至 frontend.render_interactive_chart，提供原始行情陣列給 JS 端即時運算。
-3. 政策事件功能鍵在手機端嚴格維持同列橫排。
-4. 系統名稱字體維持與次標題同級。
+1. 更新版本識別為 20261109_2235。
+2. 預設起日調整為 2000-01-01，確保完整歷史資料足以計算 1200MA（五年線）與 2400MA（十年線）。
+3. 整合 cloud_sync 模組識別，確保系統最大版本號正確回報。
 防呆防錯原因：
-1. 確保模組版本號聯動更新，維持專案追蹤一致性。
+1. 確保跨模組版本號一致性維護。
 """
 
-MODULE_VERSION = "20261109_2155"
+MODULE_VERSION = "20261109_2235"
 
 import streamlit as st
 import datetime
@@ -18,6 +17,7 @@ import pandas as pd
 import data_loader
 import chart_builder
 import frontend
+import cloud_sync
 from data_loader import (
     load_policy_events,
     fetch_taiex_data,
@@ -33,13 +33,13 @@ all_versions = [
     getattr(data_loader, "MODULE_VERSION", "0"),
     getattr(chart_builder, "MODULE_VERSION", "0"),
     getattr(frontend, "MODULE_VERSION", "0"),
+    getattr(cloud_sync, "MODULE_VERSION", "0"),
     MODULE_VERSION
 ]
 SYSTEM_VERSION = max(all_versions)
 
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# CSS 深度穿透：鎖定按鈕列同列橫排
 st.markdown("""
 <style>
 div[data-testid="stHorizontalBlock"] {
@@ -59,7 +59,6 @@ div[data-testid="stHorizontalBlock"] > div {
 </style>
 """, unsafe_allow_html=True)
 
-# 僅顯示系統版本識別
 st.caption(f"系統版本識別：{SYSTEM_VERSION}")
 st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
@@ -79,7 +78,8 @@ display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_val
 
 st.sidebar.markdown("---")
 st.sidebar.header("大盤行情載入區間")
-start_default = datetime.date(2020, 1, 1)
+# 起日預設為 2000-01-01，滿足十年線（2400MA）計算跨度
+start_default = datetime.date(2000, 1, 1)
 end_default = datetime.date.today()
 
 col_s, col_e = st.sidebar.columns(2)
@@ -92,7 +92,7 @@ if start_date > end_date:
 
 # 2. 載入資料
 events_df = load_policy_events("policy_events.json")
-with st.spinner("載入加權指數數據中..."):
+with st.spinner("載入加權指數歷史數據與雲端同步中..."):
     taiex_df = fetch_taiex_data(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
 if taiex_df.empty:
@@ -154,7 +154,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（傳入 taiex_df 提供純淨行情數據予前端 JS）
+# 4. 繪製圖表
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,

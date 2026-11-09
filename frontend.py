@@ -1,19 +1,22 @@
 """
 模組名稱：frontend.py
-版本識別：20261109_1510
+版本識別：20261109_1525
 修改目的：
-1. 建立前端專屬 HTML/JavaScript 渲染容器，徹底繞過 st.plotly_chart 的封裝盲點。
-2. 在原生 JS 端精確鎖定 dragmode='pan'，強制關閉 rangeslider，徹底消滅灰底遮罩與白色手柄。
-3. 監聽 wheel 事件與 touch/pan 事件，提供平滑平移與縮放。
-4. 實作 Y 軸動態自適應（Auto-scale Y）與最新交易日右側防呆回彈邊界。
+1. 更新版本識別為 20261109_1525。
+2. 實作 JavaScript 平移邊界防呆回彈（Clamping）：
+   - 監聽主圖 plotly_relayout 事件。
+   - 計算右邊界上限 maxAllowedRight = totalBars - 0.5。
+   - 當使用者向左拖曳（視野右移）導致 newRange[1] > maxAllowedRight 時，強制釘死右邊界並回推左邊界，絕不露出未來交易日空白。
+3. 視窗內 Y 軸動態自適應（Auto-Scale Y）：
+   - 依據當前可視的整數索引範圍切片，精確提取 High 與 Low 極值並加上 5% 緩衝區更新 yaxis.range。
+4. 嚴格鎖定 dragmode='pan' 與 scrollZoom=true，杜絕遮罩並確保單指平移與滾輪縮放。
 防呆防錯原因：
-1. 原生 JS 直接在 client-side 執行，避免 Streamlit 反覆序列化與重新渲染引發的滑桿重生。
-2. 透過 iframe 隔絕 CSS 污染，確保手機端觸控手勢判定不被父層容器攔截。
+1. 類別型態（category）下，Plotly relayout 的數值直接對應整數浮點索引，回彈防呆能 100% 阻斷向右越界。
+2. 加入 isRelayouting 旗標鎖，防止 Plotly.relayout 自身觸發事件循環導致堆疊溢位（Infinite Loop）。
 """
 
-MODULE_VERSION = "20261109_1510"
+MODULE_VERSION = "20261109_1525"
 
-import json
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
 
@@ -39,7 +42,6 @@ def render_interactive_chart(fig: go.Figure, height: int = 720):
                 width: 100%;
                 height: {height}px;
             }}
-            /* 嚴格防呆：禁止任何選取層與滑桿遮罩在 DOM 顯示 */
             .rangeslider-container, .rangeslider-mask, .selectionlayer {{
                 display: none !important;
                 visibility: hidden !important;
@@ -53,11 +55,10 @@ def render_interactive_chart(fig: go.Figure, height: int = 720):
             const figureData = {fig_json};
             const container = document.getElementById('chart-container');
 
-            // 確保 Layout 參數原生鎖定
+            // 確保 Layout 基礎配置鎖定
             figureData.layout.dragmode = 'pan';
             figureData.layout.hovermode = false;
             
-            // 雙重保證主副軸 rangeslider 完全停用
             if (figureData.layout.xaxis) {{
                 figureData.layout.xaxis.rangeslider = {{ visible: false }};
                 figureData.layout.xaxis.fixedrange = false;
@@ -81,33 +82,80 @@ def render_interactive_chart(fig: go.Figure, height: int = 720):
                 showAxisRangeEntryBoxes: false
             }};
 
+            let isRelayouting = false; // 防呆鎖：阻斷遞迴觸發
+
             Plotly.newPlot(container, figureData.data, figureData.layout, config).then(() => {{
-                // 監聽平移與縮放事件，實施視窗內 Y 軸動態 Auto-Scale
                 container.on('plotly_relayout', function(eventData) {{
-                    let x0 = eventData['xaxis.range[0]'];
-                    let x1 = eventData['xaxis.range[1]'];
-                    
-                    if (x0 && x1 && figureData.data[0]) {{
+                    if (isRelayouting) return;
+
+                    let r0 = eventData['xaxis.range[0]'];
+                    let r1 = eventData['xaxis.range[1]'];
+
+                    if (r0 !== undefined && r1 !== undefined && figureData.data[0]) {{
                         const kTrace = figureData.data[0];
+                        const totalBars = kTrace.x.length;
+                        if (totalBars === 0) return;
+
+                        let left = parseFloat(r0);
+                        let right = parseFloat(r1);
+                        let span = right - left;
+
+                        // 最小/最大視野防呆
+                        if (span < 5) {{
+                            span = 5;
+                            right = left + span;
+                        }}
+
+                        // 【關鍵機制】：右邊界回彈截斷防呆（Clamping）
+                        const maxAllowedRight = totalBars - 0.5;
+                        const minAllowedLeft = -0.5;
+                        let clamped = false;
+
+                        if (right > maxAllowedRight) {{
+                            right = maxAllowedRight;
+                            left = right - span;
+                            clamped = true;
+                        }}
+                        if (left < minAllowedLeft) {{
+                            left = minAllowedLeft;
+                            if (span > totalBars) {{
+                                right = maxAllowedRight;
+                            }} else {{
+                                right = left + span;
+                            }}
+                            clamped = true;
+                        }}
+
+                        // 【關鍵機制】：視窗內 Y 軸動態自適應（Auto-Scale Y）
+                        let startIdx = Math.max(0, Math.floor(left));
+                        let endIdx = Math.min(totalBars - 1, Math.ceil(right));
                         let minY = Infinity;
                         let maxY = -Infinity;
                         let hasData = false;
 
-                        for (let i = 0; i < kTrace.x.length; i++) {{
-                            let d = kTrace.x[i];
-                            if (d >= x0 && d <= x1) {{
-                                let low = kTrace.low[i];
-                                let high = kTrace.high[i];
-                                if (low !== null && low !== undefined) minY = Math.min(minY, low);
-                                if (high !== null && high !== undefined) maxY = Math.max(maxY, high);
-                                hasData = true;
-                            }}
+                        for (let i = startIdx; i <= endIdx; i++) {{
+                            let low = kTrace.low[i];
+                            let high = kTrace.high[i];
+                            if (low !== null && low !== undefined && !isNaN(low)) minY = Math.min(minY, low);
+                            if (high !== null && high !== undefined && !isNaN(high)) maxY = Math.max(maxY, high);
+                            hasData = true;
                         }}
 
+                        let updateObj = {{}};
+                        if (clamped) {{
+                            updateObj['xaxis.range[0]'] = left;
+                            updateObj['xaxis.range[1]'] = right;
+                        }}
                         if (hasData && minY < maxY) {{
                             let pad = (maxY - minY) * 0.05;
-                            Plotly.relayout(container, {{
-                                'yaxis.range': [minY - pad, maxY + pad]
+                            updateObj['yaxis.range[0]'] = minY - pad;
+                            updateObj['yaxis.range[1]'] = maxY + pad;
+                        }}
+
+                        if (Object.keys(updateObj).length > 0) {{
+                            isRelayouting = true;
+                            Plotly.relayout(container, updateObj).then(() => {{
+                                isRelayouting = false;
                             }});
                         }}
                     }}

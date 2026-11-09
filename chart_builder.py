@@ -1,18 +1,19 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1340
+版本識別：20261109_1348
 修改目的：
-1. 更新版本識別為 20261109_1340。
-2. 徹底根治灰色遮罩與選取拉桿問題：由 category 軸改為原生 date 軸，並透過 rangebreaks 排除週末假日。
-3. 嚴格停用 rangeslider（主圖與副圖均 rangeslider_visible=False），杜絕選取拉桿產生。
-4. 預設 dragmode="pan"，限定 X 軸平移（fixedrange=False）、Y 軸垂直絕對鎖定（fixedrange=True）。
-5. 視圖右端精準對齊最新交易日。
+1. 更新版本識別為 20261109_1348。
+2. 徹底根除灰色遮罩與白色手柄：
+   - 在 go.Candlestick 與 layout 所有軸層面徹底撲滅 rangeslider。
+3. 確保單手指（滑鼠）直接平移 X 軸（dragmode="pan"）。
+4. 鎖定 Y 軸絕對固定（fixedrange=True），禁止上下滑動。
+5. 預設最新交易日對齊最右邊界，不留空白。
 防呆防錯原因：
-1. category 軸在手機端觸控不支援原生滑動平移，會退化為範圍選取框；改用 date 軸可提供原生平滑平移與雙指開合手勢。
-2. 針對未開盤週末使用 rangebreaks 過濾，避免出現無交易日空白斷層。
+1. Plotly 的 Candlestick 預設自帶 rangeslider，必須在 update_layout 與 update_xaxes 雙重關閉，否則手機觸控會誤觸拉桿導致全圖反灰。
+2. 數值欄位強制轉換 float，排除空值與型別衝突。
 """
 
-MODULE_VERSION = "20261109_1340"
+MODULE_VERSION = "20261109_1348"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -51,7 +52,7 @@ def build_taiex_chart(
         end_idx = min(total_bars - 1, start_idx + int(display_bars) - 1)
         start_idx = max(0, end_idx - int(display_bars) + 1)
 
-    # 2. 自適應 Y 軸極值計算
+    # 2. 自適應 Y 軸極值
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
@@ -66,7 +67,7 @@ def build_taiex_chart(
     else:
         price_y_range = None
 
-    # 3. 繪製主圖 K 線
+    # 3. 繪製 K 線主圖
     fig.add_trace(
         go.Candlestick(
             x=df_market["Date"],
@@ -81,7 +82,7 @@ def build_taiex_chart(
         row=1, col=1
     )
 
-    # 4. 繪製副圖成交量
+    # 4. 繪製成交量副圖
     vol_colors = [
         "#E74C3C" if r["Close"] >= r["Open"] else "#2ECC71"
         for _, r in df_market.iterrows()
@@ -129,18 +130,17 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 配置佈局與手勢互動控制
+    # 6. 配置座標軸與手勢控制（徹底根治遮罩拉桿）
     fig.update_layout(
-        dragmode="pan",  # 關鍵：強制預設拖曳為純平移
-        xaxis_rangeslider_visible=False,
-        xaxis2_rangeslider_visible=False,
+        dragmode="pan",                    # 鎖定單指/滑鼠為平移
+        xaxis_rangeslider_visible=False,   # 徹底關閉 X 軸 rangeslider
         height=720,
         margin=dict(l=40, r=20, t=30, b=30),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # Y 軸鎖定：不可上下平移
+    # 鎖定 Y 軸不隨平移上下位移 (fixedrange=True)
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -148,19 +148,17 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # X 軸採用 date 型別，精確設定當前日期邊界，並排除週末假日
+    # 設定 X 軸起訖日期與徹底關閉任何子軸的 rangeslider
     start_date_str = str(df_market.iloc[start_idx]["Date"])
     end_date_str = str(df_market.iloc[end_idx]["Date"])
 
-    # 設定兩子圖 X 軸：允許平移、移除週末、關閉滑桿
-    for r in [1, 2]:
-        fig.update_xaxes(
-            type="date",
-            range=[start_date_str, end_date_str],
-            fixedrange=False,
-            rangeslider=dict(visible=False),
-            rangebreaks=[dict(bounds=["sat", "mon"])],  # 防呆防錯：移除週末非交易日空檔
-            row=r, col=1
-        )
+    # 全局覆蓋所有 xaxes 關閉 rangeslider 並啟用 rangebreaks
+    fig.update_xaxes(
+        type="date",
+        range=[start_date_str, end_date_str],
+        fixedrange=False,                 # 允許 X 軸平移
+        rangeslider=dict(visible=False),  # 防呆防錯：雙重確保 rangeslider 徹底隱藏
+        rangebreaks=[dict(bounds=["sat", "mon"])]
+    )
     
     return fig

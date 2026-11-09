@@ -1,16 +1,17 @@
 """
 模組名稱：app.py
-版本識別：20261109_2238
+版本識別：20261109_2245
 修改目的：
-1. 更新版本識別為 20261109_2238。
-2. 【指定交易日】分點進出明細全面升級為「買超前 20 名」與「賣超前 20 名」分頁檢視，不再受限於固定 8 檔。
-3. 表格格式清楚標註張數與金額（萬元），支援全官股合計與單一分點篩選。
+1. 更新版本識別為 20261109_2245。
+2. 買超前 20 名與賣超前 20 名嚴格排序修訂：
+   - 買超前 20 名：依「買賣超金額(萬元)」由大至小嚴格降冪排列（正數最大居首）。
+   - 賣超前 20 名：依「買賣超金額(萬元)」由負值最深至小嚴格升冪排列（賣超最大居首）。
+3. 頁面標頭即時統計前 20 名合計買超與賣超金額。
 防呆防錯原因：
-1. 針對多空排名切片時，買超取 head(20)，賣超取 tail(20) 並反轉排列，確保負值由大至小直觀呈現。
-2. 若篩選分點當日交易檔數不足 20 檔，自然呈現實際檔數，不發生 IndexError。
+1. 針對多空分頁，買超只篩選大於 0 的正向標的；賣超只篩選小於 0 的負向標的，切片前 20 筆杜絕空檔交錯。
 """
 
-MODULE_VERSION = "20261109_2238"
+MODULE_VERSION = "20261109_2245"
 
 import streamlit as st
 import datetime
@@ -186,19 +187,21 @@ else:
         "買賣超金額(萬元)": "sum"
     })
 
-# 排序並切片前 20 名
-sorted_by_amount = day_target_df.sort_values(by="買賣超金額(萬元)", ascending=False)
-top_buy_20 = sorted_by_amount.head(20).reset_index(drop=True)
-top_sell_20 = sorted_by_amount.tail(20).sort_values(by="買賣超金額(萬元)", ascending=True).reset_index(drop=True)
+# 嚴格排序邏輯：買超正值降冪；賣超負值升冪
+buy_pool = day_target_df[day_target_df["買賣超金額(萬元)"] > 0]
+sell_pool = day_target_df[day_target_df["買賣超金額(萬元)"] < 0]
+
+top_buy_20 = buy_pool.sort_values(by="買賣超金額(萬元)", ascending=False).head(20).reset_index(drop=True)
+top_sell_20 = sell_pool.sort_values(by="買賣超金額(萬元)", ascending=True).head(20).reset_index(drop=True)
 
 tab_buy, tab_sell = st.tabs(["🟢 官股買超前 20 名", "🔴 官股賣超前 20 名"])
 
 with tab_buy:
-    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名標的：**")
+    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 20 名標的（正值最大在前）：**")
     st.dataframe(top_buy_20, use_container_width=True, hide_index=True)
 
 with tab_sell:
-    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名標的：**")
+    st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 20 名標的（賣超最多在前）：**")
     st.dataframe(top_sell_20, use_container_width=True, hide_index=True)
 
 st.markdown("---")

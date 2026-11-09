@@ -1,18 +1,20 @@
 """
 模組名稱：app.py
-版本識別：20261110_0015
+版本識別：20261110_0030
 修改目的：
-1. 更新版本識別為 20261110_0015。
-2. 區間統計模組增設：
-   - 「單次回補缺失天數上限」滑桿控制項（可自訂 5 ~ 30 天，預設 10 天）。
-   - 「⚡ 強制回補缺失交易日資料」功能按鈕：點擊後清空快取，並依照指定回補天數強制回補歷史明細。
-3. 維持個股穿透檢視下拉選單買賣超雙向排序、合計總覽與前 5 大實體分點柱狀圖。
-4. 維持買賣超前 30 名、無名次欄位、張數在金額之前等既有設定。
+1. 更新版本識別為 20261110_0030。
+2. 區間個股統計表欄位整併：
+   - 移除重複的「合計買賣超(張)」欄位。
+   - 若欄位中包含「全部官股合計」，直接重新命名為「官股買賣超(張)」，確保欄位單一不重複。
+3. 個股穿透檢視選單剔除 0 張標的：移除 zero_sorted，僅保留買超與賣超張數非 0 的標的。
+4. 維持回補天數參數化滑桿與「⚡ 強制回補缺失交易日資料」功能鍵。
+5. 維持買賣超前 30 名、無名次欄位、張數在金額之前等既有設定。
 防呆防錯原因：
-1. 強制回補執行期間配合 st.spinner 與完成提示，防範重複點擊或誤判當機。
+1. 重命名欄位時加入條件判斷，避免欄位不存在引發 KeyError。
+2. 剔除 0 張標的後，若無買賣超標的則以友善提示說明，防範下拉選單為空引發 IndexError。
 """
 
-MODULE_VERSION = "20261110_0015"
+MODULE_VERSION = "20261110_0030"
 
 import streamlit as st
 import datetime
@@ -273,6 +275,7 @@ else:
         st.dataframe(pivot_branch, use_container_width=True)
 
     with tab_stock:
+        # 透視表：代號、名稱為 index，官股分點為 columns
         pivot_stock = pd.pivot_table(
             range_summary_df,
             values="買賣超張數",
@@ -281,10 +284,16 @@ else:
             aggfunc="sum",
             fill_value=0
         )
-        pivot_stock["合計買賣超(張)"] = pivot_stock.sum(axis=1)
 
-        stock_buy_df = pivot_stock[pivot_stock["合計買賣超(張)"] > 0].sort_values(by="合計買賣超(張)", ascending=False)
-        stock_sell_df = pivot_stock[pivot_stock["合計買賣超(張)"] < 0].sort_values(by="合計買賣超(張)", ascending=True)
+        # 欄位整併：若包含「全部官股合計」，更名為「官股買賣超(張)」；若有多分點則加總為該單一欄位
+        if "全部官股合計" in pivot_stock.columns:
+            pivot_stock = pivot_stock.rename(columns={"全部官股合計": "官股買賣超(張)"})
+        elif "官股買賣超(張)" not in pivot_stock.columns:
+            pivot_stock["官股買賣超(張)"] = pivot_stock.sum(axis=1)
+
+        # 區分買超與賣超子頁籤（純粹依「官股買賣超(張)」進行篩選與排序）
+        stock_buy_df = pivot_stock[pivot_stock["官股買賣超(張)"] > 0].sort_values(by="官股買賣超(張)", ascending=False)
+        stock_sell_df = pivot_stock[pivot_stock["官股買賣超(張)"] < 0].sort_values(by="官股買賣超(張)", ascending=True)
 
         tab_stock_buy, tab_stock_sell = st.tabs(["🟢 區間買超個股統計", "🔴 區間賣超個股統計"])
 
@@ -307,16 +316,18 @@ else:
 
         stock_summary = range_summary_df.groupby(["代號", "名稱"], as_index=False)["買賣超張數"].sum()
 
+        # 1. 買超個股：買賣超張數 > 0，絕對值由大到小
         buy_sorted = stock_summary[stock_summary["買賣超張數"] > 0].copy()
         buy_sorted["abs_vol"] = buy_sorted["買賣超張數"].abs()
         buy_sorted = buy_sorted.sort_values(by="abs_vol", ascending=False)
 
+        # 2. 賣超個股：買賣超張數 < 0，絕對值由小到大（賣超最少至賣超最多）
         sell_sorted = stock_summary[stock_summary["買賣超張數"] < 0].copy()
         sell_sorted["abs_vol"] = sell_sorted["買賣超張數"].abs()
         sell_sorted = sell_sorted.sort_values(by="abs_vol", ascending=True)
 
-        zero_sorted = stock_summary[stock_summary["買賣超張數"] == 0]
-        ordered_summary = pd.concat([buy_sorted, sell_sorted, zero_sorted], ignore_index=True)
+        # 嚴格排除買賣超為 0 張之標的，僅串接非零買賣超標的
+        ordered_summary = pd.concat([buy_sorted, sell_sorted], ignore_index=True)
 
         if not ordered_summary.empty:
             stock_options = [
@@ -387,4 +398,4 @@ else:
             else:
                 st.info("所選期間之各實體券商分點明細尚在陸續回補入庫中，目前先提供官股合計總覽圖。")
         else:
-            st.info("所選區間無個股資料可供繪製柱狀圖。")
+            st.info("所選區間無買賣超非 0 之個股資料可供繪製柱狀圖。")

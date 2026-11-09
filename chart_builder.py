@@ -1,13 +1,13 @@
 """
 模組名稱：chart_builder.py
 修改目的：
-1. 實作 K 線預設顯示 N 日與 X 軸可視範圍控制。
-2. 鎖定 Y 軸禁止上下拖曳（fixedrange=True），僅保留 X 軸橫向平移能力。
-3. 根據目前可視範圍切片動態計算 High 最高值與 Low 最低值，自適應設定 Y 軸範圍。
-4. 當包含最後一個交易日時，X 軸右側範圍精確對齊最新索引，避免右側留白。
+1. 解決 TypeError：因 X 軸為 category（文字日期）型別，避免使用浮點數索引傳入 range，改直接傳入對應的日期字串範圍。
+2. 數值計算防呆：強制將 High, Low, Volume 透過 pd.to_numeric 轉換為浮點數，防止 yfinance 抓取之欄位型態異常引發計算錯誤。
+3. 嚴格鎖定 Y 軸（fixedrange=True），僅開放 X 軸橫向平移。
+4. 當顯示區間包含最新交易日時，右側緊貼邊界不留空白。
 防呆防錯原因：
-1. 當使用者選擇的天數大於現有資料長度時，自動取現有資料上限，避免切片 IndexError。
-2. 計算 Y 軸極值時過濾空值與 NaN，防止繪圖引擎報錯或座標軸尺度歸零。
+1. 切片索引嚴格限制在 0 至 len(df_market)-1 之間，杜絕 IndexError。
+2. 計算 Y 軸極值時剔除 NaN 與 Inf，防止 Plotly 繪圖座標軸崩潰。
 """
 
 import pandas as pd
@@ -21,16 +21,14 @@ def build_taiex_chart(
     target_date_idx: int = None
 ) -> go.Figure:
     """
-    修改目的：建立具備右邊界對齊、Y軸鎖定、自適應高低點的加權指數價量互動圖。
-    防呆防錯原因：
-    - 若 target_date_idx 未指定，預設以最新資料為右端基準。
-    - 嚴格校驗切片起訖索引界限（0 到總長度減 1）。
+    修改目的：繪製加權指數 K 線與標記成交量，並確保 X 軸字串切片與 Y 軸動態縮放正常運作。
+    防呆防錯原因：以日期字串作為 X 軸 category 的 range 邊界，徹底排除 TypeError。
     """
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.03,
-        subplot_titles=("加權指數 (^TWII) 日K線走勢", "成交量 與 政策事件標記"),
+        subplot_titles=("加權指數 (^TWII) 日K線走勢", "成交量 與 政策事件標記 (▲/▼)"),
         row_heights=[0.7, 0.3]
     )
 
@@ -38,30 +36,40 @@ def build_taiex_chart(
     if total_bars == 0:
         return fig
 
-    # 1. 計算 X 軸顯示起訖索引與右邊際防呆
+    # 防呆防錯：確保數值欄位均為 float 型別
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df_market.columns:
+            df_market[col] = pd.to_numeric(df_market[col], errors="coerce")
+
+    # 1. 計算切片起訖索引
     if target_date_idx is None or target_date_idx >= total_bars:
-        # 預設錨定在最新一筆（最右側貼齊邊界，右側無空白）
+        # 預設錨定在最後一筆（右側邊界無空白）
         end_idx = total_bars - 1
         start_idx = max(0, end_idx - display_bars + 1)
     else:
-        # 錨定在指定事件日期（以事件日為中心或合理視角）
+        # 錨定在指定事件日期
         half = display_bars // 2
         start_idx = max(0, target_date_idx - half)
         end_idx = min(total_bars - 1, start_idx + display_bars - 1)
-        # 若右側推到底，往左反推以維持 display_bars 寬度
+        # 若推至最右端，反推起點維持指定天數
         start_idx = max(0, end_idx - display_bars + 1)
 
-    # 2. 計算顯示區間內 Y 軸之最大值與最小值（自適應縮放）
+    # 2. 動態計算顯示區間的 Y 軸最高/最低價（自適應極值）
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
-        y_min = float(visible_slice["Low"].min())
-        y_max = float(visible_slice["High"].max())
-        y_padding = (y_max - y_min) * 0.05 if y_max > y_min else 100
-        price_y_range = [y_min - y_padding, y_max + y_padding]
+        valid_low = visible_slice["Low"].dropna()
+        valid_high = visible_slice["High"].dropna()
+        if not valid_low.empty and not valid_high.empty:
+            y_min = float(valid_low.min())
+            y_max = float(valid_high.max())
+            y_pad = (y_max - y_min) * 0.05 if y_max > y_min else 100.0
+            price_y_range = [y_min - y_pad, y_max + y_pad]
+        else:
+            price_y_range = None
     else:
         price_y_range = None
 
-    # 3. 繪製主圖：K 線
+    # 3. 繪製主圖 K 線
     fig.add_trace(
         go.Candlestick(
             x=df_market["Date"],
@@ -76,10 +84,10 @@ def build_taiex_chart(
         row=1, col=1
     )
 
-    # 4. 繪製副圖：成交量柱狀圖
+    # 4. 繪製副圖成交量
     vol_colors = [
-        "#E74C3C" if row["Close"] >= row["Open"] else "#2ECC71"
-        for _, row in df_market.iterrows()
+        "#E74C3C" if r["Close"] >= r["Open"] else "#2ECC71"
+        for _, r in df_market.iterrows()
     ]
     
     fig.add_trace(
@@ -93,7 +101,7 @@ def build_taiex_chart(
         row=2, col=1
     )
 
-    # 5. 疊加成交量之政策事件標記
+    # 5. 疊加成交量之政策事件三角形標記
     if not df_events.empty and "Date" in df_events.columns and "Date" in df_market.columns:
         merged = pd.merge(df_events, df_market[["Date", "Volume"]], on="Date", how="inner")
         
@@ -124,7 +132,7 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 配置座標軸限制：鎖定 Y 軸，僅允許 X 軸平移
+    # 6. 配置座標軸限制：固定 Y 軸不允許上下移動，僅開放 X 軸水平平移
     fig.update_layout(
         xaxis_rangeslider_visible=False,
         height=720,
@@ -133,27 +141,25 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 主圖 Y 軸設定：禁止拖曳平移 (fixedrange=True) 並動態指定視圖區間範圍
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
         fig.update_yaxes(fixedrange=True, row=1, col=1)
 
-    # 副圖成交量 Y 軸亦鎖定
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # X 軸範圍鎖定：對齊類別型別，設定初始顯示區間範圍
-    start_date_str = df_market.iloc[start_idx]["Date"]
-    end_date_str = df_market.iloc[end_idx]["Date"]
-    
+    # 防呆修正：以 category 型別之「日期字串」直接指定起訖範圍，杜絕 TypeError
+    x_start_str = str(df_market.iloc[start_idx]["Date"])
+    x_end_str = str(df_market.iloc[end_idx]["Date"])
+
     fig.update_xaxes(
         type="category",
-        range=[start_idx - 0.5, end_idx + 0.5],  # 精確邊界對齊，右邊不留白
+        range=[x_start_str, x_end_str],
         row=1, col=1
     )
     fig.update_xaxes(
         type="category",
-        range=[start_idx - 0.5, end_idx + 0.5],
+        range=[x_start_str, x_end_str],
         row=2, col=1
     )
     

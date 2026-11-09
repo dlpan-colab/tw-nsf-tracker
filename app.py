@@ -1,15 +1,15 @@
 """
 模組名稱：app.py
-版本識別：20261109_1335
+版本識別：20261109_1340
 修改目的：
-1. 更新版本識別為 20261109_1335，並僅於頂部呈現系統版本識別。
-2. 傳入完整的 Plotly 配置（config），啟用雙指/滾輪縮放（scrollZoom=True），並將預設操作綁定為平移（pan2d）。
-3. 移除選取框工具按鈕（select2d, lasso2d, boxzoom），杜絕單指滑動引發灰色選區遮罩。
+1. 更新版本識別為 20261109_1340，頂部顯示最大系統版本。
+2. 配置完整 Plotly Config，移除任何可能引發選區的工具，並啟用雙指/滾輪縮放（scrollZoom=True）。
+3. 嚴格鎖定 ModeBar 預設模式為平移（pan2d）。
 防呆防錯原因：
-1. 嚴格鎖定 ModeBar 的工具項目，防止使用者誤觸進入框選或選取模式。
+1. 停用 select、lasso、boxzoom 等選區模式，防止手機單指滑動時觸發灰色遮罩。
 """
 
-MODULE_VERSION = "20261109_1335"
+MODULE_VERSION = "20261109_1340"
 
 import streamlit as st
 import datetime
@@ -150,7 +150,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（配置：單指平移、雙指/滾輪縮放、徹底移除框選遮罩工具）
+# 4. 繪製圖表（鎖定單指水平平移、雙指開合縮放、徹底移除遮罩拉桿）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
@@ -162,17 +162,9 @@ st.plotly_chart(
     use_container_width=True,
     config={
         "scrollZoom": True,
-        "displayModeBar": True,
-        "modeBarButtonsToRemove": [
-            "select2d",
-            "lasso2d",
-            "zoom2d",
-            "zoomIn2d",
-            "zoomOut2d",
-            "autoScale2d",
-            "resetScale2d"
-        ],
-        "modeBarButtonsToAdd": ["pan2d"]
+        "displayModeBar": False,   # 防呆防錯：直接關閉工具列，避免手機觸控誤切為選區模式
+        "showAxisDragHandles": False,
+        "showAxisRangeEntryBoxes": False
     }
 )
 

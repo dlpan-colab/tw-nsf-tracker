@@ -1,19 +1,16 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_2345
+版本識別：20261109_2350
 修改目的：
-1. 更新版本識別為 20261109_2345。
-2. 解除區間統計僅抓最後 3 個交易日的限制（移除 dates[-3:] 切片），完整支援 15~30 天以上歷史工作日檢索。
-3. 實作 FinMind 券商分點明細（TaiwanStockSecuritiesBrokerTrades）對接與漸進式「慢慢補」機制：
-   - 設定八大公股分點代碼對應表。
-   - 優先讀取本機與 Google Drive 歷史庫（gov_trades_history.csv）；缺失日期逐日補充並追加落地。
-4. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+1. 更新版本識別為 20261109_2350。
+2. 資料落地聚合：當抓取到實質分點明細時，除了保留各分點原生紀錄，
+   同步聚合計算一筆「全部官股合計」紀錄，確保走勢圖能同時提供合計圖與前 5 大分點圖。
+3. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
 防呆防錯原因：
-1. 若 Streamlit Secrets 未配置 FinMind Token，自動平滑降級為證交所公開端點，不阻斷程式。
-2. 區間回補加入微延遲與異常捕獲，防範高頻請求遭封鎖。
+1. 聚合運算時使用 drop_duplicates 確保交易日期、官股分點與代號之唯一性，防止重複累計。
 """
 
-MODULE_VERSION = "20261109_2345"
+MODULE_VERSION = "20261109_2350"
 
 import os
 import json
@@ -30,7 +27,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 LOCAL_TAIEX_FILE = os.path.join(CACHE_DIR, "taiex_history.csv")
 LOCAL_GOV_FILE = os.path.join(CACHE_DIR, "gov_trades_history.csv")
 
-# 八大官股券商總行代號對應
 GOV_BROKER_MAP = {
     "1020": "臺灣銀行",
     "1030": "台灣土地銀行",
@@ -126,12 +122,9 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
     """透過 FinMind API 取得八大官股分點在特定日期的進出明細"""
     token = st.secrets.get("finmind", {}).get("api_token", "")
     url = "https://api.finmindtrade.com/api/v4/data"
-    
-    # 若有設定 token 則使用，否則使用免 token 輕量請求
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    
     records = []
-    # 針對八大官股券商代碼查詢
+    
     for b_code, b_name in GOV_BROKER_MAP.items():
         params = {
             "dataset": "TaiwanStockSecuritiesBrokerTrades",
@@ -150,7 +143,7 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
                     sell_v = int(item.get("sell", 0))
                     net_v = buy_v - sell_v
                     price = float(item.get("price", 0.0))
-                    net_amt = round(net_v * price * 0.1, 2)  # 概算金額(萬元)
+                    net_amt = round(net_v * price * 0.1, 2)
                     
                     records.append({
                         "交易日期": trade_date,
@@ -166,7 +159,17 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
             pass
 
     if records:
-        return pd.DataFrame(records)
+        df_rec = pd.DataFrame(records)
+        # 自動聚合產出一筆「全部官股合計」
+        df_sum = df_rec.groupby(["交易日期", "代號", "名稱"], as_index=False).agg({
+            "買進張數": "sum",
+            "賣出張數": "sum",
+            "買賣超張數": "sum",
+            "金額(萬元)": "sum"
+        })
+        df_sum["官股分點"] = "全部官股合計"
+        return pd.concat([df_rec, df_sum], ignore_index=True)
+
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
 def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
@@ -228,9 +231,7 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    # 優先嘗試透過 FinMind 抓取 8 大分點
     new_df = _query_finmind_gov_trades(trade_date)
-    # 若 FinMind 查無資料或未配置 token，則回退至 TWSE 官方端點
     if new_df.empty:
         new_df = _query_twse_gov_ranking(trade_date)
 
@@ -267,20 +268,16 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFra
         except Exception:
             cached_db = pd.DataFrame()
 
-    # 產生指定區間的所有工作日
     work_days = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d").tolist()
     recorded_days = set(cached_db["交易日期"].unique()) if not cached_db.empty and "交易日期" in cached_db.columns else set()
     
-    # 找出缺失的日期（排除週末）
     missing_days = [d for d in work_days if d not in recorded_days]
 
-    # 若有缺失工作日，採「慢慢補」策略（每次統計最多溫和回補近 5 個缺失交易日，避免超額）
     if missing_days:
         for m_day in missing_days[-5:]:
             fetch_gov_branch_trades(m_day)
-            time.sleep(0.2)  # 溫和延遲
+            time.sleep(0.2)
 
-        # 重新載入最新資料庫
         if os.path.exists(LOCAL_GOV_FILE):
             try:
                 cached_db = pd.read_csv(LOCAL_GOV_FILE)

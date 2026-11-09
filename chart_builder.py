@@ -1,20 +1,16 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1525
+版本識別：20261109_1535
 修改目的：
-1. 更新版本識別為 20261109_1525。
-2. X 軸強制設定為類別型態（type='category'）：
-   - 僅繪製實際開盤交易日，從根源杜絕週末、假日與未來交易日排入所延伸的空白。
-3. 初始視野嚴格鎖定：
-   - 最右側緊貼最後一根 K 棒（end_idx + 0.5），右端絕不留白。
-4. 取消 K 線與成交量之浮動標籤（hoverinfo="none"、hovertemplate=None）。
-5. 鎖定 Y 軸固定鎖死（fixedrange=True），由前端 JS 動態接管縮放。
+1. 更新版本識別為 20261109_1535。
+2. 保持 X 軸為 category 類型，初始視野鎖定在 [start_idx - 0.5, end_idx + 0.5]。
+3. 嚴格鎖定 Y 軸 fixedrange=True（禁止手動垂直拖拉，交由 frontend.py 動態適配）。
+4. K 線與成交量移除浮動白框（hoverinfo="none"），行情數值由上方固定資訊條統一承載。
 防呆防錯原因：
-1. category 軸索引映射防呆：以整數索引切片計算起始點，防止日期字串比對落空。
-2. 數值欄位全部強制轉換為 float，防止空值引發 JSON 序列化失敗。
+1. 傳入圖表之所有價量強制透過 pd.to_numeric 清洗，避免空值造成前端 JSON 解析崩潰。
 """
 
-MODULE_VERSION = "20261109_1525"
+MODULE_VERSION = "20261109_1535"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -68,7 +64,7 @@ def build_taiex_chart(
     else:
         price_y_range = None
 
-    # 3. 繪製 K 線主圖（取消浮動標籤）
+    # 3. 繪製 K 線主圖
     fig.add_trace(
         go.Candlestick(
             x=df_market["Date"],
@@ -85,7 +81,7 @@ def build_taiex_chart(
         row=1, col=1
     )
 
-    # 4. 繪製成交量副圖（取消浮動標籤）
+    # 4. 繪製成交量副圖
     vol_colors = [
         "#E74C3C" if r["Close"] >= r["Open"] else "#2ECC71"
         for _, r in df_market.iterrows()
@@ -138,13 +134,13 @@ def build_taiex_chart(
     # 6. 配置全域佈局
     fig.update_layout(
         dragmode="pan",
-        hovermode=False,
+        hovermode="x unified",
         height=720,
         margin=dict(l=40, r=20, t=30, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸禁止手動上下拖拉（交由前端 JS 自動適配）
+    # 鎖定 Y 軸（交由前端動態 auto-scale）
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -152,7 +148,7 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 【關鍵機制】：強制類別型態（category），初始顯示範圍鎖定在 [start_idx - 0.5, end_idx + 0.5]
+    # 設定 X 軸 category 類型與起訖索引
     x_bounds = [start_idx - 0.5, end_idx + 0.5]
     for r in [1, 2]:
         fig.update_xaxes(

@@ -1,16 +1,18 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1535
+版本識別：20261109_2155
 修改目的：
-1. 更新版本識別為 20261109_1535。
-2. 保持 X 軸為 category 類型，初始視野鎖定在 [start_idx - 0.5, end_idx + 0.5]。
-3. 嚴格鎖定 Y 軸 fixedrange=True（禁止手動垂直拖拉，交由 frontend.py 動態適配）。
-4. K 線與成交量移除浮動白框（hoverinfo="none"），行情數值由上方固定資訊條統一承載。
+1. 更新版本識別為 20261109_2155。
+2. X 軸月份標籤最佳化：遍歷交易日清單，僅在每月首個交易日標註月份名稱（tickvals 與 ticktext），保持軸刻度簡潔。
+3. 高度由 720px 縮減至 540px，搭配自適應間距，實現手機一屏容納。
+4. 副圖成交量座標鎖定與自適應初始計算，預留合理比例消除空白。
+5. 取消所有浮動標籤（hoverinfo="none"），行情數值由上方固定資訊條統一承載。
 防呆防錯原因：
-1. 傳入圖表之所有價量強制透過 pd.to_numeric 清洗，避免空值造成前端 JSON 解析崩潰。
+1. 建立月份切換標記時，比對相鄰日期的 YYYY-MM，確保每年每月第一個交易日精準命中。
+2. 價量欄位全部使用 pd.to_numeric 清洗，避免空值造成序列化錯誤。
 """
 
-MODULE_VERSION = "20261109_1535"
+MODULE_VERSION = "20261109_2155"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,9 +27,9 @@ def build_taiex_chart(
     fig = make_subplots(
         rows=2, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.03,
+        vertical_spacing=0.04,
         subplot_titles=("加權指數 (^TWII) 日K線走勢", "成交量 與 政策事件標記 (▲/▼)"),
-        row_heights=[0.7, 0.3]
+        row_heights=[0.72, 0.28]
     )
 
     total_bars = len(df_market)
@@ -54,6 +56,7 @@ def build_taiex_chart(
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
         valid_high = visible_slice["High"].dropna()
+        valid_vol = visible_slice["Volume"].dropna()
         if not valid_low.empty and not valid_high.empty:
             y_min = float(valid_low.min())
             y_max = float(valid_high.max())
@@ -61,8 +64,12 @@ def build_taiex_chart(
             price_y_range = [y_min - y_pad, y_max + y_pad]
         else:
             price_y_range = None
+            
+        max_v = float(valid_vol.max()) if not valid_vol.empty else 0
+        vol_y_range = [0, max_v * 1.25] if max_v > 0 else None
     else:
         price_y_range = None
+        vol_y_range = None
 
     # 3. 繪製 K 線主圖
     fig.add_trace(
@@ -116,7 +123,7 @@ def build_taiex_chart(
                         mode="markers+text",
                         marker=dict(
                             symbol=event["marker"],
-                            size=15,
+                            size=14,
                             color=event["color"],
                             line=dict(width=1.5, color="#1C2833")
                         ),
@@ -131,31 +138,57 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 配置全域佈局
+    # 6. 計算月份首日刻度（僅在每月首個交易日標註月份）
+    month_tick_vals = []
+    month_tick_texts = []
+    prev_month = ""
+    for idx, d_str in enumerate(df_market["Date"]):
+        m_str = d_str[:7] # YYYY-MM
+        if m_str != prev_month:
+            month_tick_vals.append(d_str)
+            month_tick_texts.append(m_str[5:7] + "月")
+            prev_month = m_str
+
+    # 7. 全域佈局
     fig.update_layout(
         dragmode="pan",
         hovermode="x unified",
-        height=720,
-        margin=dict(l=40, r=20, t=30, b=30),
+        height=540,
+        margin=dict(l=35, r=15, t=25, b=25),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸（交由前端動態 auto-scale）
+    # 鎖定 Y 軸（交由前端動態自適應）
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
         fig.update_yaxes(fixedrange=True, row=1, col=1)
 
-    fig.update_yaxes(fixedrange=True, row=2, col=1)
+    if vol_y_range:
+        fig.update_yaxes(range=vol_y_range, fixedrange=True, row=2, col=1)
+    else:
+        fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 設定 X 軸 category 類型與起訖索引
+    # 設定 X 軸 category 類型與刻度
     x_bounds = [start_idx - 0.5, end_idx + 0.5]
-    for r in [1, 2]:
-        fig.update_xaxes(
-            type="category",
-            range=x_bounds,
-            fixedrange=False,
-            row=r, col=1
-        )
+    
+    # 主圖 X 軸隱藏刻度文字
+    fig.update_xaxes(
+        type="category",
+        range=x_bounds,
+        fixedrange=False,
+        showticklabels=False,
+        row=1, col=1
+    )
+    # 副圖 X 軸僅呈現每月首個交易日之月份
+    fig.update_xaxes(
+        type="category",
+        range=x_bounds,
+        fixedrange=False,
+        tickmode="array",
+        tickvals=month_tick_vals,
+        ticktext=month_tick_texts,
+        row=2, col=1
+    )
     
     return fig

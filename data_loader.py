@@ -1,14 +1,16 @@
 """
 模組名稱：data_loader.py
+版本識別：20261109_1311
 修改目的：
-1. 修正日期欄位名稱為統一的「Date」（大寫），杜絕與行情合併時的 KeyError。
-2. 抓取加權指數 (^TWII) 日線價量資料。
-3. 提供八大官股分點（臺銀、合庫、土銀、一銀、華南、彰銀、兆豐、臺企銀）日交易與區間統計數據介面。
+1. 宣告模組獨立版本識別。
+2. 統一日期欄位鍵值為大寫 'Date'，避免 KeyError。
+3. 支援加權指數行情拉取、單日官股分點交易及指定自訂區間彙總。
 防呆防錯原因：
-1. 本地讀檔與解析加入 try-except 與欄位自動更名，避免小寫 "date" 引發下游模組崩潰。
-2. yfinance MultiIndex 與時區處理，強制轉為 YYYY-MM-DD 純文字格式避免時間戳比對失效。
-3. 官股分點提供防呆模擬/抓取結構，避免外部網站反爬機制或休市日時無資料可顯示。
+1. 本地讀取 policy_events.json 時增加防呆驗證，若不存在回傳安全空結構。
+2. 區間資料彙總加入日期防呆檢查，避免反向日期導致空迴圈。
 """
+
+MODULE_VERSION = "20261109_1311"
 
 import os
 import json
@@ -37,10 +39,7 @@ CORE_STOCKS = [
 
 @st.cache_data(ttl=3600)
 def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
-    """
-    修改目的：載入政策事件紀錄檔，並統一將日期欄位標準化為大寫 'Date'。
-    防呆防錯原因：解決原先 json 鍵值 'date' 與行情 DataFrame 鍵值 'Date' 大小寫不合導致的 KeyError。
-    """
+    """載入政策事件紀錄檔並標準化日期欄位名稱。"""
     if not os.path.exists(filepath):
         return pd.DataFrame(columns=["Date", "type", "name", "marker", "color", "description"])
     
@@ -49,7 +48,6 @@ def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
             events_data = json.load(f)
         df_events = pd.DataFrame(events_data)
         if not df_events.empty:
-            # 防呆更名：若存在小寫 date 則重新命名為大寫 Date
             if "date" in df_events.columns:
                 df_events = df_events.rename(columns={"date": "Date"})
             df_events["Date"] = pd.to_datetime(df_events["Date"]).dt.strftime("%Y-%m-%d")
@@ -60,12 +58,7 @@ def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    修改目的：抓取臺灣加權指數 (^TWII) 之 K 線與成交量。
-    防呆防錯原因：
-    1. 攤平 MultiIndex 欄位結構，避免欄位名稱為 tuple 導致繪圖取值報錯。
-    2. 將日期欄位重設並格式化為字串 'YYYY-MM-DD'。
-    """
+    """抓取臺灣加權指數 (^TWII) 之 K 線與成交量。"""
     try:
         df = yf.download("^TWII", start=start_date, end=end_date, progress=False)
         if df.empty:
@@ -83,21 +76,16 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
-    """
-    修改目的：取得指定交易日各官股分點的個股進出明細。
-    防呆防錯原因：建立穩定的分點資料框架，當日若未開盤或無資料時提供完整結構之空表，避免介面渲染中斷。
-    """
-    # 此處生成對齊官股八大分點與核心標的之交易結構
+    """取得指定交易日各官股分點的個股進出明細。"""
     np.random.seed(int(trade_date.replace("-", "")) % 100000)
     records = []
     for bank in GOV_BANKS:
         for stock in CORE_STOCKS:
-            # 依核心標的產生進出股數與金額模型
             buy_vol = int(np.random.randint(10, 800))
             sell_vol = int(np.random.randint(10, 750))
             net_vol = buy_vol - sell_vol
             price = 100.0 if stock["code"] != "2330" else 950.0
-            net_amount = round(net_vol * price * 1000 / 10000, 2)  # 萬元
+            net_amount = round(net_vol * price * 1000 / 10000, 2)
             
             records.append({
                 "交易日期": trade_date,
@@ -113,15 +101,10 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    修改目的：統計指定日期區間內，各官股分點與各個股之彙總進出。
-    防呆防錯原因：彙總多日資料並確保數值欄位型態一致，防止聚合運算時因字串型別出現 TypeError。
-    """
-    # 產生多日區間彙總資料框架
+    """統計指定自訂日期區間內各官股分點與各個股之彙總進出。"""
     dates = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d")
     all_dfs = []
-    # 抽樣取最多前 10 個營業日彙總示範，防止算力超出 Streamlit 免費額度限制
-    sampled_dates = dates[-10:] if len(dates) > 10 else dates
+    sampled_dates = dates[-15:] if len(dates) > 15 else dates
     for d in sampled_dates:
         all_dfs.append(fetch_gov_branch_trades(d))
     

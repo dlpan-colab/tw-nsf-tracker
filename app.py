@@ -1,23 +1,23 @@
 """
 模組名稱：app.py
-版本識別：20261109_2315
+版本識別：20261109_2330
 修改目的：
-1. 更新版本識別為 20261109_2315。
-2. 買賣超排名由前 20 名擴展為前 30 名。
-3. 表格無「名次」欄位，維持欄位順序：['代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
-4. 買賣超前 30 名排序與空值防呆：
-   - 買超前 30 名：依金額降冪排序（正值最大排首位）。
-   - 賣超前 30 名：依金額升冪排序（負值最深賣超最多排首位）。
-   - 當日查無真實資料或休市時，直接提示「無官方交易數據」，不偽造資料。
+1. 更新版本識別為 20261109_2330。
+2. 「個股於各分點統計」拆分子頁籤為「🟢 區間買超個股統計」與「🔴 區間賣超個股統計」。
+3. 增加個股穿透功能：於個股統計表下方提供個股選單，自動篩選期間內進出最大的 5 個分點，
+   並繪製 5 張各分點每日買賣超柱狀圖（紅買綠賣）。
+4. 維持買賣超前 30 名排行、無名次欄位、張數在金額之前等既有設定。
 防呆防錯原因：
-1. 資料為空時以 st.info 顯示，杜絕表格切片或分頁引發 KeyError / IndexError。
+1. 若所選個股進出的分點不足 5 個，自動依實際分點家數繪圖，避免切片引發 IndexError。
+2. 圖表設定 autosize 與響應式佈局，並對無資料狀態進行防呆提示。
 """
 
-MODULE_VERSION = "20261109_2315"
+MODULE_VERSION = "20261109_2330"
 
 import streamlit as st
 import datetime
 import pandas as pd
+import plotly.graph_objects as go
 import data_loader
 import chart_builder
 import frontend
@@ -240,9 +240,9 @@ range_summary_df = fetch_range_gov_branch_summary(
 if range_summary_df.empty:
     st.info("所選統計區間內查無官股進出紀錄。")
 else:
-    tab1, tab2 = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
+    tab_branch, tab_stock = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
 
-    with tab1:
+    with tab_branch:
         st.markdown("**各官股分點於所選區間買賣各個股明細（買賣超張數）：**")
         pivot_branch = pd.pivot_table(
             range_summary_df,
@@ -254,8 +254,8 @@ else:
         )
         st.dataframe(pivot_branch, use_container_width=True)
 
-    with tab2:
-        st.markdown("**市場核心個股在八大官股分點之買賣超張數彙總：**")
+    with tab_stock:
+        # 計算每檔個股在各分點的合計
         pivot_stock = pd.pivot_table(
             range_summary_df,
             values="買賣超張數",
@@ -265,4 +265,74 @@ else:
             fill_value=0
         )
         pivot_stock["合計買賣超(張)"] = pivot_stock.sum(axis=1)
-        st.dataframe(pivot_stock.sort_values(by="合計買賣超(張)", ascending=False), use_container_width=True)
+
+        # 區分買超與賣超子頁籤
+        stock_buy_df = pivot_stock[pivot_stock["合計買賣超(張)"] > 0].sort_values(by="合計買賣超(張)", ascending=False)
+        stock_sell_df = pivot_stock[pivot_stock["合計買賣超(張)"] < 0].sort_values(by="合計買賣超(張)", ascending=True)
+
+        tab_stock_buy, tab_stock_sell = st.tabs(["🟢 區間買超個股統計", "🔴 區間賣超個股統計"])
+
+        with tab_stock_buy:
+            st.markdown("**所選區間【買超】個股於各分點分佈：**")
+            if not stock_buy_df.empty:
+                st.dataframe(stock_buy_df, use_container_width=True)
+            else:
+                st.info("此區間無合計買超之個股。")
+
+        with tab_stock_sell:
+            st.markdown("**所選區間【賣超】個股於各分點分佈：**")
+            if not stock_sell_df.empty:
+                st.dataframe(stock_sell_df, use_container_width=True)
+            else:
+                st.info("此區間無合計賣超之個股。")
+
+        st.markdown("---")
+        st.markdown("#### 🔍 個股穿透檢視：最大買賣超五大分點每日進出明細")
+
+        # 彙整所有出現過的個股代號與名稱作為下拉選單
+        available_stocks = range_summary_df[["代號", "名稱"]].drop_duplicates().sort_values("代號")
+        stock_options = [f"{r['代號']} {r['名稱']}" for _, r in available_stocks.iterrows()]
+
+        if stock_options:
+            selected_stock_label = st.selectbox("請選擇欲深入檢視的個股：", stock_options, index=0)
+            selected_code = selected_stock_label.split()[0]
+            selected_name = selected_stock_label.split()[1] if len(selected_stock_label.split()) > 1 else ""
+
+            # 提取該個股的歷史進出紀錄
+            target_stock_df = range_summary_df[range_summary_df["代號"] == selected_code]
+
+            # 計算該個股在各分點的絕對值累計進出，取前 5 大主力分點
+            branch_activity = target_stock_df.groupby("官股分點")["買賣超張數"].apply(lambda s: s.abs().sum()).sort_values(ascending=False)
+            top_5_branches = branch_activity.head(5).index.tolist()
+
+            st.markdown(f"**【{selected_stock_label}】 區間內最大買賣超 5 大分點每日走勢圖：**")
+
+            # 依序呈現 5 張柱狀圖（以 2~3 欄位清晰呈現）
+            chart_cols = st.columns(min(len(top_5_branches), 3)) if top_5_branches else []
+            for i, branch_name in enumerate(top_5_branches):
+                col_target = chart_cols[i % len(chart_cols)]
+                b_df = target_stock_df[target_stock_df["官股分點"] == branch_name].sort_values("交易日期")
+                
+                # 柱狀顏色：買超為紅、賣超為綠
+                colors = ["#E74C3C" if v >= 0 else "#2ECC71" for v in b_df["買賣超張數"]]
+                
+                fig_branch = go.Figure(data=[
+                    go.Bar(
+                        x=b_df["交易日期"],
+                        y=b_df["買賣超張數"],
+                        marker_color=colors,
+                        hovertemplate="日期: %{x}<br>買賣超: %{y}張<extra></extra>"
+                    )
+                ])
+                fig_branch.update_layout(
+                    title=dict(text=f"<b>{branch_name}</b>", font=dict(size=13)),
+                    height=240,
+                    margin=dict(l=20, r=10, t=35, b=25),
+                    xaxis=dict(type="category", showticklabels=True, tickfont=dict(size=9)),
+                    yaxis=dict(title="張數", title_font=dict(size=10), tickfont=dict(size=9)),
+                    showlegend=False
+                )
+                with col_target:
+                    st.plotly_chart(fig_branch, use_container_width=True)
+        else:
+            st.info("所選區間無個股資料可供繪製柱狀圖。")

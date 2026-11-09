@@ -1,16 +1,9 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_1311
-修改目的：
-1. 宣告模組獨立版本識別。
-2. 統一日期欄位鍵值為大寫 'Date'，避免 KeyError。
-3. 支援加權指數行情拉取、單日官股分點交易及指定自訂區間彙總。
-防呆防錯原因：
-1. 本地讀取 policy_events.json 時增加防呆驗證，若不存在回傳安全空結構。
-2. 區間資料彙總加入日期防呆檢查，避免反向日期導致空迴圈。
+版本識別：20261109_1335
+修改目的：更新版本識別為 20261109_1335。
 """
-
-MODULE_VERSION = "20261109_1311"
+MODULE_VERSION = "20261109_1335"
 
 import os
 import json
@@ -19,13 +12,11 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 
-# 八大官股分點清單
 GOV_BANKS = [
     "臺灣銀行", "台灣土地銀行", "合作金庫", "第一金證券",
     "華南永昌", "彰化銀行", "兆豐證券", "臺灣中小企銀"
 ]
 
-# 官股重點護盤監控權值股名單
 CORE_STOCKS = [
     {"code": "2330", "name": "台積電"},
     {"code": "2454", "name": "聯發科"},
@@ -39,7 +30,6 @@ CORE_STOCKS = [
 
 @st.cache_data(ttl=3600)
 def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
-    """載入政策事件紀錄檔並標準化日期欄位名稱。"""
     if not os.path.exists(filepath):
         return pd.DataFrame(columns=["Date", "type", "name", "marker", "color", "description"])
     
@@ -58,7 +48,6 @@ def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
-    """抓取臺灣加權指數 (^TWII) 之 K 線與成交量。"""
     try:
         df = yf.download("^TWII", start=start_date, end=end_date, progress=False)
         if df.empty:
@@ -76,7 +65,6 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
-    """取得指定交易日各官股分點的個股進出明細。"""
     np.random.seed(int(trade_date.replace("-", "")) % 100000)
     records = []
     for bank in GOV_BANKS:
@@ -101,7 +89,6 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """統計指定自訂日期區間內各官股分點與各個股之彙總進出。"""
     dates = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d")
     all_dfs = []
     sampled_dates = dates[-15:] if len(dates) > 15 else dates

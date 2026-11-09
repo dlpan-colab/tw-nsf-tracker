@@ -8,8 +8,8 @@
 
 import streamlit as st
 import datetime
-from modules.data_loader import load_policy_events, fetch_market_data
-from modules.chart_builder import build_price_volume_chart
+from data_loader import load_policy_events, fetch_market_data
+from chart_builder import build_price_volume_chart
 
 # 頁面配置
 st.set_page_config(
@@ -49,7 +49,7 @@ if start_date > end_date:
     st.stop()
 
 # 載入政策事件
-events_df = load_policy_events("data/policy_events.json")
+events_df = load_policy_events("policy_events.json")
 
 # 呈現圖例說明
 st.markdown("""

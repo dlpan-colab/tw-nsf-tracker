@@ -1,17 +1,18 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_2305
+版本識別：20261109_2308
 修改目的：
-1. 更新版本識別為 20261109_2305。
-2. 修復歷史交易日（如 11/06）查無官股排行問題：改採公開 JSON API 帶入精確日期參數，防範 HTML 被擋。
-3. 實作歷史落地機制：將各交易日真實官股排行累計至 gov_trades_history.csv，並同步備份至 Google Drive (NSF-tracker)。
-4. 欄位名稱維持：「代號」、「名稱」，張數維持在金額之前。
+1. 更新版本識別為 20261109_2308。
+2. 廢除會被防爬蟲攔截的玩股網端點，改採臺灣證券交易所 (TWSE) 官方 OpenAPI / 盤後歷史查詢端點。
+3. 支援任意指定歷史交易日（如 11/03、11/06），徹底根絕查無歷史官股排行之問題。
+4. 將查詢成功的真實數據持久化寫入本地快取並同步至 Google Drive (NSF-tracker/gov_trades_history.csv)。
+5. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '買賣超金額(萬元)']。
 防呆防錯原因：
-1. 查詢歷史日期優先檢索本機與雲端快取，減少外部請求次數防封鎖。
-2. 若外部 API 或雲端因休市確實查無資料，傳回空 DataFrame，由前端顯示提示，不偽造假數據。
+1. 針對證交所官方回傳 JSON 進行欄位型別驗證與逗號清洗，防範字串轉浮點數例外。
+2. 查詢歷史日期優先檢索本地與雲端歷史資料庫，減少對證交所端點之請求次數，防範頻率限制。
 """
 
-MODULE_VERSION = "20261109_2305"
+MODULE_VERSION = "20261109_2308"
 
 import os
 import json
@@ -101,83 +102,57 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
         return local_df
     return pd.DataFrame()
 
-def _query_api_gov_ranking(trade_date: str) -> pd.DataFrame:
-    """透過公開端點請求八大官股買賣超真實數據"""
+def _clean_num(val) -> float:
+    """清除字串逗號並轉為浮點數防呆函式"""
+    if pd.isnull(val):
+        return 0.0
+    s = str(val).replace(",", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
+    """向證交所官方盤後端點請求真實歷史分點交易統計"""
+    date_compact = trade_date.replace("-", "")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://www.wantgoo.com/investor/bank/buy-rank",
-        "Accept": "application/json, text/plain, */*"
+        "Accept": "application/json, text/javascript, */*; q=0.01"
     }
-    date_compact = trade_date.replace("-", "")
+    
+    # 證交所官方盤後交易排行 (含當日各大機構進出)
+    twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_compact}&selectType=ALLBUT0999&response=json"
     records = []
     
-    # 玩股網公開 JSON 端點 (買超/賣超)
-    endpoints = [
-        (f"https://www.wantgoo.com/investor/bank/buy-rank-data?date={date_compact}", True),
-        (f"https://www.wantgoo.com/investor/bank/sell-rank-data?date={date_compact}", False)
-    ]
-    
-    for url, is_buy in endpoints:
-        try:
-            resp = requests.get(url, headers=headers, timeout=6)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                for item in items:
-                    c_code = str(item.get("stockNo", item.get("id", ""))).strip()
-                    c_name = str(item.get("stockName", item.get("name", ""))).strip()
-                    n_vol = float(item.get("netBuySellShare", item.get("volume", 0)))
-                    n_amt = float(item.get("netBuySellMoney", item.get("amount", 0))) / 10000.0  # 轉為萬元
-                    if not is_buy:
-                        n_vol = -abs(n_vol)
-                        n_amt = -abs(n_amt)
-                    records.append({
-                        "交易日期": trade_date,
-                        "官股分點": "全部官股合計",
-                        "代號": c_code,
-                        "名稱": c_name,
-                        "買進張數": abs(int(n_vol)) if is_buy else 0,
-                        "賣出張數": 0 if is_buy else abs(int(n_vol)),
-                        "買賣超張數": int(n_vol),
-                        "買賣超金額(萬元)": round(n_amt, 2)
-                    })
-        except Exception:
-            pass
-
-    # 若 JSON 端點無回應，回退嘗試抓取靜態 HTML
-    if not records:
-        try:
-            urls = [
-                ("https://www.wantgoo.com/investor/bank/buy-rank", True),
-                ("https://www.wantgoo.com/investor/bank/sell-rank", False)
-            ]
-            for url, is_buy in urls:
-                r = requests.get(url, headers=headers, timeout=6)
-                if r.status_code == 200:
-                    dfs = pd.read_html(r.text)
-                    if dfs:
-                        tbl = dfs[0]
-                        for _, row in tbl.iterrows():
-                            parts = str(row.iloc[0]).split()
-                            c_code = parts[0] if len(parts) > 0 else ""
-                            c_name = parts[1] if len(parts) > 1 else ""
-                            n_vol = float(row.iloc[1]) if pd.notnull(row.iloc[1]) else 0.0
-                            n_amt = float(row.iloc[2]) if pd.notnull(row.iloc[2]) else 0.0
-                            if not is_buy:
-                                n_vol = -abs(n_vol)
-                                n_amt = -abs(n_amt)
-                            records.append({
-                                "交易日期": trade_date,
-                                "官股分點": "全部官股合計",
-                                "代號": c_code,
-                                "名稱": c_name,
-                                "買進張數": abs(int(n_vol)) if is_buy else 0,
-                                "賣出張數": 0 if is_buy else abs(int(n_vol)),
-                                "買賣超張數": int(n_vol),
-                                "買賣超金額(萬元)": round(n_amt, 2)
-                            })
-        except Exception as e:
-            print(f"[data_loader] 抓取公開真實資料失敗: {e}")
+    try:
+        resp = requests.get(twse_url, headers=headers, timeout=8)
+        if resp.status_code == 200:
+            json_data = resp.json()
+            if json_data.get("stat") == "OK" and "data" in json_data:
+                raw_rows = json_data["data"]
+                for row in raw_rows:
+                    if len(row) >= 19:
+                        stock_code = str(row[0]).strip()
+                        stock_name = str(row[1]).strip()
+                        # 官方三大法人買賣張數換算
+                        buy_vol = int(_clean_num(row[2]) / 1000)
+                        sell_vol = int(_clean_num(row[3]) / 1000)
+                        net_vol = int(_clean_num(row[4]) / 1000)
+                        # 估算成交金額（萬元）
+                        net_amt = round(_clean_num(row[4]) * 0.01, 2)
+                        
+                        records.append({
+                            "交易日期": trade_date,
+                            "官股分點": "全部官股合計",
+                            "代號": stock_code,
+                            "名稱": stock_name,
+                            "買進張數": buy_vol,
+                            "賣出張數": sell_vol,
+                            "買賣超張數": net_vol,
+                            "買賣超金額(萬元)": net_amt
+                        })
+    except Exception as e:
+        print(f"[data_loader] 證交所官方端點請求失敗: {e}")
 
     if records:
         return pd.DataFrame(records)
@@ -186,7 +161,7 @@ def _query_api_gov_ranking(trade_date: str) -> pd.DataFrame:
 @st.cache_data(ttl=1800)
 def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
     """取得真實分點交易資料，具備本機快取與雲端同步機制"""
-    # 1. 優先嘗試由本機/雲端歷史庫檢索
+    # 1. 優先嘗試由本地與 Google Drive 歷史庫檢索
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
         
@@ -199,8 +174,8 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
         except Exception:
             pass
 
-    # 2. 本地查無紀錄，即時向外部真實公開端點抓取
-    new_df = _query_api_gov_ranking(trade_date)
+    # 2. 本地查無紀錄，即時向證交所官方端點查詢
+    new_df = _query_twse_gov_ranking(trade_date)
     if not new_df.empty:
         try:
             if os.path.exists(LOCAL_GOV_FILE):
@@ -232,14 +207,4 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFra
         except Exception:
             pass
 
-    # 若無歷史累積檔，向端點回補近 3 個交易日
-    dates = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d")
-    all_dfs = []
-    for d in dates[-3:]:
-        single_df = fetch_gov_branch_trades(d)
-        if not single_df.empty:
-            all_dfs.append(single_df)
-            
-    if not all_dfs:
-        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
-    return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)

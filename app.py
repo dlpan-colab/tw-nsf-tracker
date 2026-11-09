@@ -1,17 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261109_1510
+版本識別：20261109_1525
 修改目的：
-1. 更新模組版本為 20261109_1510，頂部僅顯示系統最大版本號。
-2. 徹底捨棄 st.plotly_chart，改用 frontend.render_interactive_chart 進行原生 HTML/JS 渲染。
+1. 更新版本識別為 20261109_1525，頂部呈現系統最大版本號。
+2. 保持調用 frontend.render_interactive_chart 進行原生 HTML/JS 渲染。
 3. 政策事件功能鍵在手機端嚴格維持同列橫排。
 4. 系統名稱字體維持與次標題同級。
 防呆防錯原因：
-1. 透過獨立 frontend 容器徹底杜絕 Streamlit 客戶端組件造成的 rangeslider 遮罩死灰復燃。
-2. 保證單指水平平移與滾輪縮放原生響應。
+1. 保證事件跳轉定位與圖表索引無縫對接。
 """
 
-MODULE_VERSION = "20261109_1510"
+MODULE_VERSION = "20261109_1525"
 
 import streamlit as st
 import datetime
@@ -155,7 +154,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（呼叫前端自訂渲染模組，徹底排除遮罩與滑桿）
+# 4. 繪製圖表（呼叫前端自訂渲染模組，實施邊界回彈與動態 Y 軸自適應）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,

@@ -1,18 +1,20 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1510
+版本識別：20261109_1525
 修改目的：
-1. 更新版本識別為 20261109_1510。
-2. 回歸標準金融繪圖架構，產出結構完整的 go.Candlestick。
-3. 嚴格取消 K 線上浮動標籤（hoverinfo="none"、hovertemplate=None）。
-4. 鎖定 Y 軸不可手動上下拖拉（fixedrange=True），X 軸保留水平平移能力。
-5. 起訖區間精準設定，右端貼齊最新交易日。
+1. 更新版本識別為 20261109_1525。
+2. X 軸強制設定為類別型態（type='category'）：
+   - 僅繪製實際開盤交易日，從根源杜絕週末、假日與未來交易日排入所延伸的空白。
+3. 初始視野嚴格鎖定：
+   - 最右側緊貼最後一根 K 棒（end_idx + 0.5），右端絕不留白。
+4. 取消 K 線與成交量之浮動標籤（hoverinfo="none"、hovertemplate=None）。
+5. 鎖定 Y 軸固定鎖死（fixedrange=True），由前端 JS 動態接管縮放。
 防呆防錯原因：
-1. 數值欄位全部強制轉換為 float，防止空值與型別衝突引發 Plotly 序列化失敗。
-2. 設定 rangebreaks 移除週末休市空檔，維持走勢連續性。
+1. category 軸索引映射防呆：以整數索引切片計算起始點，防止日期字串比對落空。
+2. 數值欄位全部強制轉換為 float，防止空值引發 JSON 序列化失敗。
 """
 
-MODULE_VERSION = "20261109_1510"
+MODULE_VERSION = "20261109_1525"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -134,9 +136,6 @@ def build_taiex_chart(
                 )
 
     # 6. 配置全域佈局
-    start_date_str = str(df_market.iloc[start_idx]["Date"])
-    end_date_str = str(df_market.iloc[end_idx]["Date"])
-
     fig.update_layout(
         dragmode="pan",
         hovermode=False,
@@ -145,7 +144,7 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸不隨手勢拖動上下位移
+    # 鎖定 Y 軸禁止手動上下拖拉（交由前端 JS 自動適配）
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -153,20 +152,14 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 設定 X 軸原生時間軸並排除週末休市
-    fig.update_xaxes(
-        type="date",
-        range=[start_date_str, end_date_str],
-        fixedrange=False,
-        rangebreaks=[dict(bounds=["sat", "mon"])],
-        row=1, col=1
-    )
-    fig.update_xaxes(
-        type="date",
-        range=[start_date_str, end_date_str],
-        fixedrange=False,
-        rangebreaks=[dict(bounds=["sat", "mon"])],
-        row=2, col=1
-    )
+    # 【關鍵機制】：強制類別型態（category），初始顯示範圍鎖定在 [start_idx - 0.5, end_idx + 0.5]
+    x_bounds = [start_idx - 0.5, end_idx + 0.5]
+    for r in [1, 2]:
+        fig.update_xaxes(
+            type="category",
+            range=x_bounds,
+            fixedrange=False,
+            row=r, col=1
+        )
     
     return fig

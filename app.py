@@ -1,19 +1,18 @@
 """
 模組名稱：app.py
-版本識別：20261110_0005
+版本識別：20261110_0015
 修改目的：
-1. 更新版本識別為 20261110_0005。
-2. 個股穿透檢視下拉選單排序調整：
-   - 先排序買超個股：合計買超張數 > 0，依絕對值由大到小排序（買超最大居首位）。
-   - 再排序賣超個股：合計賣超張數 < 0，依絕對值由小到大排序（賣超最少至賣超最多）。
-   - 兩者依序串接為下拉選單選項，並標記累計買賣超張數。
-3. 維持「全部官股合計」全幅走勢圖與 5 大主力實體分點每日買賣超柱狀圖。
+1. 更新版本識別為 20261110_0015。
+2. 區間統計模組增設：
+   - 「單次回補缺失天數上限」滑桿控制項（可自訂 5 ~ 30 天，預設 10 天）。
+   - 「⚡ 強制回補缺失交易日資料」功能按鈕：點擊後清空快取，並依照指定回補天數強制回補歷史明細。
+3. 維持個股穿透檢視下拉選單買賣超雙向排序、合計總覽與前 5 大實體分點柱狀圖。
 4. 維持買賣超前 30 名、無名次欄位、張數在金額之前等既有設定。
 防呆防錯原因：
-1. 若個股合計為 0 或無符合條件之標的，以 drop_duplicates 原生清單為備援，避免 IndexError。
+1. 強制回補執行期間配合 st.spinner 與完成提示，防範重複點擊或誤判當機。
 """
 
-MODULE_VERSION = "20261110_0005"
+MODULE_VERSION = "20261110_0015"
 
 import streamlit as st
 import datetime
@@ -28,6 +27,7 @@ from data_loader import (
     fetch_taiex_data,
     fetch_gov_branch_trades,
     fetch_range_gov_branch_summary,
+    clear_gov_cache,
     GOV_BANKS
 )
 from chart_builder import build_taiex_chart
@@ -231,11 +231,28 @@ if stat_start > stat_end:
     st.error("統計起始日期不可晚於結束日期！")
     st.stop()
 
+col_fill_param, col_btn = st.columns([3, 2])
+with col_fill_param:
+    fill_days_param = st.slider("單次回補缺失天數上限", min_value=5, max_value=30, value=10, step=5)
+with col_btn:
+    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+    if st.button("⚡ 強制回補缺失交易日資料", use_container_width=True):
+        clear_gov_cache()
+        with st.spinner(f"正在強制回補近 {fill_days_param} 個缺失交易日數據並同步雲端..."):
+            fetch_range_gov_branch_summary(
+                stat_start.strftime("%Y-%m-%d"),
+                stat_end.strftime("%Y-%m-%d"),
+                max_fill_days=fill_days_param
+            )
+        st.success("回補作業完成，資料庫已更新並同步！")
+        st.rerun()
+
 st.info(f"當前彙總統計區間：**{stat_start.strftime('%Y-%m-%d')}** 至 **{stat_end.strftime('%Y-%m-%d')}**")
 
 range_summary_df = fetch_range_gov_branch_summary(
     stat_start.strftime("%Y-%m-%d"),
-    stat_end.strftime("%Y-%m-%d")
+    stat_end.strftime("%Y-%m-%d"),
+    max_fill_days=fill_days_param
 )
 
 if range_summary_df.empty:
@@ -256,7 +273,6 @@ else:
         st.dataframe(pivot_branch, use_container_width=True)
 
     with tab_stock:
-        # 計算每檔個股在各分點的合計
         pivot_stock = pd.pivot_table(
             range_summary_df,
             values="買賣超張數",
@@ -267,7 +283,6 @@ else:
         )
         pivot_stock["合計買賣超(張)"] = pivot_stock.sum(axis=1)
 
-        # 區分買超與賣超子頁籤
         stock_buy_df = pivot_stock[pivot_stock["合計買賣超(張)"] > 0].sort_values(by="合計買賣超(張)", ascending=False)
         stock_sell_df = pivot_stock[pivot_stock["合計買賣超(張)"] < 0].sort_values(by="合計買賣超(張)", ascending=True)
 
@@ -290,20 +305,16 @@ else:
         st.markdown("---")
         st.markdown("#### 🔍 個股穿透檢視：官股合計與五大主力分點每日進出走勢")
 
-        # 彙總各標的之全區間官股買賣超總計，進行雙向排序
         stock_summary = range_summary_df.groupby(["代號", "名稱"], as_index=False)["買賣超張數"].sum()
 
-        # 1. 買超個股：買賣超張數 > 0，依絕對值由大到小排序（買超最大居首位）
         buy_sorted = stock_summary[stock_summary["買賣超張數"] > 0].copy()
         buy_sorted["abs_vol"] = buy_sorted["買賣超張數"].abs()
         buy_sorted = buy_sorted.sort_values(by="abs_vol", ascending=False)
 
-        # 2. 賣超個股：買賣超張數 < 0，依絕對值由小到大排序（賣超最少至賣超最多）
         sell_sorted = stock_summary[stock_summary["買賣超張數"] < 0].copy()
         sell_sorted["abs_vol"] = sell_sorted["買賣超張數"].abs()
         sell_sorted = sell_sorted.sort_values(by="abs_vol", ascending=True)
 
-        # 串接選項清單（買超優先，其後為賣超，最後為無變動標的）
         zero_sorted = stock_summary[stock_summary["買賣超張數"] == 0]
         ordered_summary = pd.concat([buy_sorted, sell_sorted, zero_sorted], ignore_index=True)
 
@@ -317,10 +328,9 @@ else:
             selected_code = selected_stock_label.split()[0]
             selected_name = selected_stock_label.split()[1] if len(selected_stock_label.split()) > 1 else ""
 
-            # 提取該個股的歷史進出紀錄
             target_stock_df = range_summary_df[range_summary_df["代號"] == selected_code]
 
-            # 1. 保留並呈現【全部官股合計】總覽柱狀圖
+            # 1. 全部官股合計走勢圖
             total_stock_df = target_stock_df[target_stock_df["官股分點"] == "全部官股合計"].sort_values("交易日期")
             if not total_stock_df.empty:
                 st.markdown(f"**【{selected_code} {selected_name}】 全部官股合計每日買賣超走勢：**")
@@ -343,7 +353,7 @@ else:
                 )
                 st.plotly_chart(fig_total, use_container_width=True)
 
-            # 2. 篩選排除「全部官股合計」後的具體券商分點，取累計進出絕對值前 5 大分點
+            # 2. 排除合計後的 5 大主力實體分點
             specific_branch_df = target_stock_df[target_stock_df["官股分點"] != "全部官股合計"]
             if not specific_branch_df.empty:
                 branch_activity = specific_branch_df.groupby("官股分點")["買賣超張數"].apply(lambda s: s.abs().sum()).sort_values(ascending=False)

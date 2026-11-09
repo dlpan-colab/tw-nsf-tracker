@@ -1,16 +1,15 @@
 """
 模組名稱：app.py
-版本識別：20261109_1325
+版本識別：20261109_1335
 修改目的：
-1. 系統名稱字體改用 st.subheader，大小與「政策事件快速定位」完全同級。
-2. 傳入 config={"scrollZoom": True}，允許雙指開合或滑鼠滾輪進行直覺放大縮小。
-3. 頂部僅呈現系統版本識別（取各模組版本最大值）。
+1. 更新版本識別為 20261109_1335，並僅於頂部呈現系統版本識別。
+2. 傳入完整的 Plotly 配置（config），啟用雙指/滾輪縮放（scrollZoom=True），並將預設操作綁定為平移（pan2d）。
+3. 移除選取框工具按鈕（select2d, lasso2d, boxzoom），杜絕單指滑動引發灰色選區遮罩。
 防呆防錯原因：
-1. 限制圖表滾輪縮放與平移配置，避免觸控時觸發全螢幕放大或瀏覽器預設滾動衝突。
-2. 維護事件索引防呆界限，確保按鈕跳轉不引發 IndexError。
+1. 嚴格鎖定 ModeBar 的工具項目，防止使用者誤觸進入框選或選取模式。
 """
 
-MODULE_VERSION = "20261109_1325"
+MODULE_VERSION = "20261109_1335"
 
 import streamlit as st
 import datetime
@@ -26,7 +25,7 @@ from data_loader import (
 )
 from chart_builder import build_taiex_chart
 
-# 計算系統版本識別（取所有模組之最大版本號）
+# 提取最大版本識別
 all_versions = [
     getattr(data_loader, "MODULE_VERSION", "0"),
     getattr(chart_builder, "MODULE_VERSION", "0"),
@@ -58,8 +57,6 @@ div[data-testid="stHorizontalBlock"] > div {
 
 # 僅顯示系統版本識別
 st.caption(f"系統版本識別：{SYSTEM_VERSION}")
-
-# 修改目的：系統名稱縮小至與政策事件定位相同層級（採用 st.subheader）
 st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
 # 1. 初始化 Session State
@@ -153,7 +150,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（啟用 scrollZoom=True 支援雙指開合/滾輪縮放，搭配 dragmode="pan" 進行單指平移）
+# 4. 繪製圖表（配置：單指平移、雙指/滾輪縮放、徹底移除框選遮罩工具）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
@@ -164,9 +161,18 @@ st.plotly_chart(
     chart_fig,
     use_container_width=True,
     config={
-        "scrollZoom": True,            # 修改目的：開啟雙指開合/滑鼠滾輪放大縮小
+        "scrollZoom": True,
         "displayModeBar": True,
-        "modeBarButtonsToRemove": ["select2d", "lasso2d"]  # 防呆防錯：移除選框工具，避免誤切成選框模式
+        "modeBarButtonsToRemove": [
+            "select2d",
+            "lasso2d",
+            "zoom2d",
+            "zoomIn2d",
+            "zoomOut2d",
+            "autoScale2d",
+            "resetScale2d"
+        ],
+        "modeBarButtonsToAdd": ["pan2d"]
     }
 )
 

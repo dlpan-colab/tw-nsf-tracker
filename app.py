@@ -1,22 +1,24 @@
 """
 模組名稱：app.py
-版本識別：20261109_1435
+版本識別：20261109_1510
 修改目的：
-1. 更新版本識別為 20261109_1435，介面頂端僅顯示系統最大版本號。
-2. 注入精準前端 CSS：封殺 .rangeslider-container 與 .selectionlayer 等遮罩 DOM，徹底避免手機瀏覽器繪出灰底與白柄。
+1. 更新模組版本為 20261109_1510，頂部僅顯示系統最大版本號。
+2. 徹底捨棄 st.plotly_chart，改用 frontend.render_interactive_chart 進行原生 HTML/JS 渲染。
 3. 政策事件功能鍵在手機端嚴格維持同列橫排。
-4. 設定圖表滾輪/雙指縮放（scrollZoom=True）與單指水平平移。
+4. 系統名稱字體維持與次標題同級。
 防呆防錯原因：
-1. 針對前端 rangeslider-container 注入 display: none !important，在樣式層施加雙重防線。
+1. 透過獨立 frontend 容器徹底杜絕 Streamlit 客戶端組件造成的 rangeslider 遮罩死灰復燃。
+2. 保證單指水平平移與滾輪縮放原生響應。
 """
 
-MODULE_VERSION = "20261109_1435"
+MODULE_VERSION = "20261109_1510"
 
 import streamlit as st
 import datetime
 import pandas as pd
 import data_loader
 import chart_builder
+import frontend
 from data_loader import (
     load_policy_events,
     fetch_taiex_data,
@@ -25,21 +27,22 @@ from data_loader import (
     GOV_BANKS
 )
 from chart_builder import build_taiex_chart
+from frontend import render_interactive_chart
 
 # 提取最大版本識別
 all_versions = [
     getattr(data_loader, "MODULE_VERSION", "0"),
     getattr(chart_builder, "MODULE_VERSION", "0"),
+    getattr(frontend, "MODULE_VERSION", "0"),
     MODULE_VERSION
 ]
 SYSTEM_VERSION = max(all_versions)
 
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# CSS 深度穿透：強制按鈕同列橫排 ＋ 徹底封殺 rangeslider 與遮罩圖層
+# CSS 深度穿透：鎖定按鈕列同列橫排
 st.markdown("""
 <style>
-/* 按鈕容器橫向同列排版，手機寬度下禁止折行 */
 div[data-testid="stHorizontalBlock"] {
     flex-wrap: nowrap !important;
     gap: 6px !important;
@@ -53,20 +56,6 @@ div[data-testid="stHorizontalBlock"] > div {
     font-size: 14px;
     font-weight: bold;
     white-space: nowrap;
-}
-
-/* 【徹底根絕遮罩】封殺 Plotly rangeslider 容器與選區圖層 */
-.rangeslider-container,
-.rangeslider-mask,
-.rangeslider-grabbers,
-.selectionlayer,
-.select-outline,
-.select-box,
-g.select-outline {
-    display: none !important;
-    opacity: 0 !important;
-    visibility: hidden !important;
-    pointer-events: none !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -166,23 +155,14 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表
+# 4. 繪製圖表（呼叫前端自訂渲染模組，徹底排除遮罩與滑桿）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
     display_bars=display_days,
     target_date_idx=st.session_state.focus_target_idx
 )
-st.plotly_chart(
-    chart_fig,
-    use_container_width=True,
-    config={
-        "scrollZoom": True,
-        "displayModeBar": False,
-        "showAxisDragHandles": False,
-        "showAxisRangeEntryBoxes": False
-    }
-)
+render_interactive_chart(chart_fig, height=720)
 
 st.markdown("---")
 

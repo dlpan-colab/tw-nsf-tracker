@@ -1,17 +1,18 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1335
+版本識別：20261109_1340
 修改目的：
-1. 更新版本識別為 20261109_1335。
-2. 徹底解決單指操作產生灰色遮罩選區問題：在 layout 全域與各子圖層面均強制鎖定 dragmode="pan"，禁止產生 selection 遮罩。
-3. 明確設定 X 軸 fixedrange=False（允許平移）、Y 軸 fixedrange=True（絕對鎖定不可上下平移）。
-4. 維持最新交易日緊貼右側邊際不留白。
+1. 更新版本識別為 20261109_1340。
+2. 徹底根治灰色遮罩與選取拉桿問題：由 category 軸改為原生 date 軸，並透過 rangebreaks 排除週末假日。
+3. 嚴格停用 rangeslider（主圖與副圖均 rangeslider_visible=False），杜絕選取拉桿產生。
+4. 預設 dragmode="pan"，限定 X 軸平移（fixedrange=False）、Y 軸垂直絕對鎖定（fixedrange=True）。
+5. 視圖右端精準對齊最新交易日。
 防呆防錯原因：
-1. 嚴格限制 Y 軸固定，防止手勢平移時 Y 軸被意外拖動導致 K 線尺度失真。
-2. 預設排除選取遮罩渲染，杜絕手機端觸控滑動時產生反灰區塊。
+1. category 軸在手機端觸控不支援原生滑動平移，會退化為範圍選取框；改用 date 軸可提供原生平滑平移與雙指開合手勢。
+2. 針對未開盤週末使用 rangebreaks 過濾，避免出現無交易日空白斷層。
 """
 
-MODULE_VERSION = "20261109_1335"
+MODULE_VERSION = "20261109_1340"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -50,7 +51,7 @@ def build_taiex_chart(
         end_idx = min(total_bars - 1, start_idx + int(display_bars) - 1)
         start_idx = max(0, end_idx - int(display_bars) + 1)
 
-    # 2. 自適應 Y 軸極值
+    # 2. 自適應 Y 軸極值計算
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
@@ -128,18 +129,18 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 配置座標軸互動（關鍵修訂：強制 dragmode="pan" 杜絕區間選取灰底）
+    # 6. 配置佈局與手勢互動控制
     fig.update_layout(
-        dragmode="pan",
-        selectdirection=None,  # 防呆：停用方向性選取
+        dragmode="pan",  # 關鍵：強制預設拖曳為純平移
         xaxis_rangeslider_visible=False,
+        xaxis2_rangeslider_visible=False,
         height=720,
         margin=dict(l=40, r=20, t=30, b=30),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸（不可平移上下）
+    # Y 軸鎖定：不可上下平移
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -147,9 +148,19 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 開放 X 軸平移（fixedrange=False），設定初始顯示整數界限
-    x_range_bounds = [start_idx - 0.5, end_idx + 0.5]
-    fig.update_xaxes(type="category", range=x_range_bounds, fixedrange=False, row=1, col=1)
-    fig.update_xaxes(type="category", range=x_range_bounds, fixedrange=False, row=2, col=1)
+    # X 軸採用 date 型別，精確設定當前日期邊界，並排除週末假日
+    start_date_str = str(df_market.iloc[start_idx]["Date"])
+    end_date_str = str(df_market.iloc[end_idx]["Date"])
+
+    # 設定兩子圖 X 軸：允許平移、移除週末、關閉滑桿
+    for r in [1, 2]:
+        fig.update_xaxes(
+            type="date",
+            range=[start_date_str, end_date_str],
+            fixedrange=False,
+            rangeslider=dict(visible=False),
+            rangebreaks=[dict(bounds=["sat", "mon"])],  # 防呆防錯：移除週末非交易日空檔
+            row=r, col=1
+        )
     
     return fig

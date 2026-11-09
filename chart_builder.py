@@ -1,18 +1,16 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_2155
+版本識別：20261109_2235
 修改目的：
-1. 更新版本識別為 20261109_2155。
-2. X 軸月份標籤最佳化：遍歷交易日清單，僅在每月首個交易日標註月份名稱（tickvals 與 ticktext），保持軸刻度簡潔。
-3. 高度由 720px 縮減至 540px，搭配自適應間距，實現手機一屏容納。
-4. 副圖成交量座標鎖定與自適應初始計算，預留合理比例消除空白。
-5. 取消所有浮動標籤（hoverinfo="none"），行情數值由上方固定資訊條統一承載。
+1. 更新版本識別為 20261109_2235。
+2. 增設均線系統：計算半年線（120MA）、年線（240MA）、五年線（1200MA）、十年線（2400MA），疊加於 K 線主圖。
+3. 均線設定 hoverinfo="none"，避免游標懸浮產生干擾。
+4. 維持 X 軸月度首日刻度標籤與 Y 軸極值動態計算。
 防呆防錯原因：
-1. 建立月份切換標記時，比對相鄰日期的 YYYY-MM，確保每年每月第一個交易日精準命中。
-2. 價量欄位全部使用 pd.to_numeric 清洗，避免空值造成序列化錯誤。
+1. 對於歷史資料長度不足計算五年線或十年線的部分，dropna 自然跳過，不引發繪圖例外。
 """
 
-MODULE_VERSION = "20261109_2155"
+MODULE_VERSION = "20261109_2235"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,7 +26,7 @@ def build_taiex_chart(
         rows=2, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        subplot_titles=("加權指數 (^TWII) 日K線走勢", "成交量 與 政策事件標記 (▲/▼)"),
+        subplot_titles=("加權指數 (^TWII) 日K線走勢 與 長期均線", "成交量 與 政策事件標記 (▲/▼)"),
         row_heights=[0.72, 0.28]
     )
 
@@ -40,6 +38,12 @@ def build_taiex_chart(
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df_market.columns:
             df_market[col] = pd.to_numeric(df_market[col], errors="coerce")
+
+    # 計算各長週期均線
+    df_market["MA120"] = df_market["Close"].rolling(window=120).mean()
+    df_market["MA240"] = df_market["Close"].rolling(window=240).mean()
+    df_market["MA1200"] = df_market["Close"].rolling(window=1200).mean()
+    df_market["MA2400"] = df_market["Close"].rolling(window=2400).mean()
 
     # 1. 計算切片整數索引界限
     if target_date_idx is None or target_date_idx >= total_bars:
@@ -87,6 +91,28 @@ def build_taiex_chart(
         ),
         row=1, col=1
     )
+
+    # 3-1. 疊加均線系統
+    ma_configs = [
+        ("MA120", "半年線(120MA)", "#E67E22", 1.2),
+        ("MA240", "年線(240MA)", "#3498DB", 1.4),
+        ("MA1200", "五年線(1200MA)", "#9B59B6", 1.6),
+        ("MA2400", "十年線(2400MA)", "#1ABC9C", 1.8),
+    ]
+    for col_name, ma_label, color, line_w in ma_configs:
+        if col_name in df_market.columns and not df_market[col_name].dropna().empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_market["Date"],
+                    y=df_market[col_name],
+                    mode="lines",
+                    line=dict(color=color, width=line_w),
+                    name=ma_label,
+                    hoverinfo="none",
+                    hovertemplate=None
+                ),
+                row=1, col=1
+            )
 
     # 4. 繪製成交量副圖
     vol_colors = [
@@ -143,7 +169,7 @@ def build_taiex_chart(
     month_tick_texts = []
     prev_month = ""
     for idx, d_str in enumerate(df_market["Date"]):
-        m_str = d_str[:7] # YYYY-MM
+        m_str = d_str[:7]
         if m_str != prev_month:
             month_tick_vals.append(d_str)
             month_tick_texts.append(m_str[5:7] + "月")
@@ -158,7 +184,6 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸（交由前端動態自適應）
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -169,10 +194,8 @@ def build_taiex_chart(
     else:
         fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 設定 X 軸 category 類型與刻度
     x_bounds = [start_idx - 0.5, end_idx + 0.5]
     
-    # 主圖 X 軸隱藏刻度文字
     fig.update_xaxes(
         type="category",
         range=x_bounds,
@@ -180,7 +203,6 @@ def build_taiex_chart(
         showticklabels=False,
         row=1, col=1
     )
-    # 副圖 X 軸僅呈現每月首個交易日之月份
     fig.update_xaxes(
         type="category",
         range=x_bounds,

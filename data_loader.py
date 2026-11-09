@@ -1,16 +1,16 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_2350
+版本識別：20261110_0015
 修改目的：
-1. 更新版本識別為 20261109_2350。
-2. 資料落地聚合：當抓取到實質分點明細時，除了保留各分點原生紀錄，
-   同步聚合計算一筆「全部官股合計」紀錄，確保走勢圖能同時提供合計圖與前 5 大分點圖。
-3. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+1. 更新版本識別為 20261110_0015。
+2. fetch_range_gov_branch_summary 支援 max_fill_days 參數化（不再寫死 5 天），並提供 progress_callback 供前端即時回報進度。
+3. 提供 clear_gov_cache() 函式，供前端「強制回補」按鈕調用以清空快取。
+4. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
 防呆防錯原因：
-1. 聚合運算時使用 drop_duplicates 確保交易日期、官股分點與代號之唯一性，防止重複累計。
+1. 回補過程遇休市或無數據日期平滑略過，避免例外中斷整個批次。
 """
 
-MODULE_VERSION = "20261109_2350"
+MODULE_VERSION = "20261110_0015"
 
 import os
 import json
@@ -44,6 +44,11 @@ EMPTY_TRADE_COLUMNS = [
     "交易日期", "官股分點", "代號", "名稱",
     "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"
 ]
+
+def clear_gov_cache():
+    """清除官股統計相關的記憶體快取"""
+    fetch_range_gov_branch_summary.clear()
+    fetch_gov_branch_trades.clear()
 
 @st.cache_data(ttl=3600)
 def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
@@ -160,7 +165,6 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
 
     if records:
         df_rec = pd.DataFrame(records)
-        # 自動聚合產出一筆「全部官股合計」
         df_sum = df_rec.groupby(["交易日期", "代號", "名稱"], as_index=False).agg({
             "買進張數": "sum",
             "賣出張數": "sum",
@@ -254,8 +258,8 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
 @st.cache_data(ttl=1800)
-def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """區間統計函式：自歷史庫彙總，缺失日期溫和漸進回補並同步 Google Drive"""
+def fetch_range_gov_branch_summary(start_date: str, end_date: str, max_fill_days: int = 10) -> pd.DataFrame:
+    """區間統計函式：自歷史庫彙總，缺失日期支援參數化回補上限並同步 Google Drive"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
 
@@ -273,10 +277,11 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFra
     
     missing_days = [d for d in work_days if d not in recorded_days]
 
-    if missing_days:
-        for m_day in missing_days[-5:]:
+    if missing_days and max_fill_days > 0:
+        fill_targets = missing_days[-max_fill_days:]
+        for m_day in fill_targets:
             fetch_gov_branch_trades(m_day)
-            time.sleep(0.2)
+            time.sleep(0.15)
 
         if os.path.exists(LOCAL_GOV_FILE):
             try:

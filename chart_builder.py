@@ -1,17 +1,17 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1311
+版本識別：20261109_1325
 修改目的：
-1. 宣告模組獨立版本識別。
-2. 鎖定 Y 軸僅允許 X 軸水平平移，解決上下晃動問題。
-3. category 軸範圍嚴格使用整數索引 float 邊界，徹底排除 TypeError。
-4. 最新一日交易日緊貼右側邊際，不留空白。
+1. 更新版本識別為 20261109_1325。
+2. 設定 dragmode="pan"，將預設手勢/滑鼠操作設為左右平移（排除預設框選縮放干擾）。
+3. 維持 Y 軸固定鎖定（fixedrange=True），僅開放 X 軸平移。
+4. 最新一日交易日緊貼右側邊界不留空白。
 防呆防錯原因：
-1. 針對 High, Low, Volume 強制轉 float，避免非數值型別導致 Plotly 計算出錯。
-2. 索引夾在 0 與 len-1 內，杜絕負數或超出資料長度。
+1. 嚴格限定 X 軸平移行為，防止手勢誤觸導致 Y 軸上下位移或行情曲線縮成一直線。
+2. 數值欄位強制轉為 float，防止空值引發 Plotly 內部減法計算錯誤。
 """
 
-MODULE_VERSION = "20261109_1311"
+MODULE_VERSION = "20261109_1325"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -35,6 +35,7 @@ def build_taiex_chart(
     if total_bars == 0:
         return fig
 
+    # 數值型別防呆轉換
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df_market.columns:
             df_market[col] = pd.to_numeric(df_market[col], errors="coerce")
@@ -49,7 +50,7 @@ def build_taiex_chart(
         end_idx = min(total_bars - 1, start_idx + int(display_bars) - 1)
         start_idx = max(0, end_idx - int(display_bars) + 1)
 
-    # 2. 自適應 Y 軸最高最低價
+    # 2. 自適應 Y 軸極值計算
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
@@ -64,7 +65,7 @@ def build_taiex_chart(
     else:
         price_y_range = None
 
-    # 3. K 線主圖
+    # 3. 繪製 K 線主圖
     fig.add_trace(
         go.Candlestick(
             x=df_market["Date"],
@@ -79,7 +80,7 @@ def build_taiex_chart(
         row=1, col=1
     )
 
-    # 4. 成交量副圖
+    # 4. 繪製成交量副圖
     vol_colors = [
         "#E74C3C" if r["Close"] >= r["Open"] else "#2ECC71"
         for _, r in df_market.iterrows()
@@ -96,7 +97,7 @@ def build_taiex_chart(
         row=2, col=1
     )
 
-    # 5. 政策標記
+    # 5. 疊加政策標記
     if not df_events.empty and "Date" in df_events.columns and "Date" in df_market.columns:
         merged = pd.merge(df_events, df_market[["Date", "Volume"]], on="Date", how="inner")
         
@@ -127,8 +128,9 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 鎖定 Y 軸，僅允許 X 軸平移
+    # 6. 配置座標軸與手勢互動（關鍵：預設 dragmode="pan" 左右平移）
     fig.update_layout(
+        dragmode="pan",  # 防呆防錯：預設啟用拖曳平移，禁止預設選框放大破壞版面
         xaxis_rangeslider_visible=False,
         height=720,
         margin=dict(l=40, r=20, t=30, b=30),
@@ -136,6 +138,7 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
+    # 鎖定 Y 軸不隨平移上下位移
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -143,7 +146,7 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # X 軸範圍鎖定：右端無縫貼齊
+    # X 軸整數邊界精準對齊，右側不留白
     x_range_bounds = [start_idx - 0.5, end_idx + 0.5]
     fig.update_xaxes(type="category", range=x_range_bounds, row=1, col=1)
     fig.update_xaxes(type="category", range=x_range_bounds, row=2, col=1)

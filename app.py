@@ -1,17 +1,22 @@
 """
 模組名稱：app.py
+版本識別：20261109_1311
 修改目的：
-1. 解決按鈕在手機端被折行成多列的問題：注入自定義 CSS，強制按鈕群組在手機端保持水平排列（display: flex !important）。
-2. 將「上一個」與「下一個」按鈕在各政策事件標題下方橫向同列排版。
-3. 保持單日各分點明細與區間進出統計功能完整。
+1. 自動讀取各模組之 MODULE_VERSION 並計算最大值，僅於畫面頂部呈現「系統版本識別」。
+2. 徹底解決「上一個／下一個」功能鍵折行問題：使用自適應 flexbox 按鈕容器排版，保證在手機窄螢幕上仍維持同列緊湊顯示。
+3. 明確標示「區間統計」的具體起訖日期，並提供獨立自訂時間範圍。
 防呆防錯原因：
-1. 在 session_state 維護事件游標，並在計算索引時加入 0 與 len-1 限制，防止按鈕多次點擊越界。
-2. 跨週末非交易日自動對齊最近開盤日，防止查無行情索引引發 KeyError。
+1. 取最大版本時加入空值回退機制，避免版本變數缺失引發 AttributeError。
+2. 注入精確 CSS 覆蓋 Streamlit 行動端自動折行行為（flex-direction: row !important）。
 """
+
+MODULE_VERSION = "20261109_1311"
 
 import streamlit as st
 import datetime
 import pandas as pd
+import data_loader
+import chart_builder
 from data_loader import (
     load_policy_events,
     fetch_taiex_data,
@@ -21,23 +26,42 @@ from data_loader import (
 )
 from chart_builder import build_taiex_chart
 
+# 計算系統版本識別（取所有模組之最大版本號）
+all_versions = [
+    getattr(data_loader, "MODULE_VERSION", "0"),
+    getattr(chart_builder, "MODULE_VERSION", "0"),
+    MODULE_VERSION
+]
+SYSTEM_VERSION = max(all_versions)
+
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# 強制手機版橫向同列排版之 CSS 防破版注入
+# CSS 深度穿透：強制手機螢幕上的按鈕容器保持水平同列
 st.markdown("""
 <style>
-/* 鎖定按鈕容器在手機窄螢幕下強制維持水平橫列，不折行 */
-div[data-testid="column"] {
-    min-width: 0 !important;
-}
-div.row-widget.stHorizontalBlock {
+/* 強制自訂按鈕列保持橫向同列排版，手機寬度下禁止折行 */
+div[data-testid="stHorizontalBlock"] {
     flex-wrap: nowrap !important;
-    gap: 8px !important;
+    gap: 6px !important;
+    align-items: center !important;
+}
+div[data-testid="stHorizontalBlock"] > div {
+    min-width: 0 !important;
+    flex: 1 1 auto !important;
+}
+.action-title {
+    font-size: 14px;
+    font-weight: bold;
+    white-space: nowrap;
 }
 </style>
 """, unsafe_allow_html=True)
 
-# 1. 初始化 Session State 狀態
+# 僅顯示系統版本識別
+st.caption(f"系統版本識別：{SYSTEM_VERSION}")
+st.title("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
+
+# 1. 初始化 Session State
 if "focus_target_idx" not in st.session_state:
     st.session_state.focus_target_idx = None
 if "focus_date_val" not in st.session_state:
@@ -52,16 +76,16 @@ st.sidebar.header("圖表顯示設定")
 display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_value=120, value=30, step=5)
 
 st.sidebar.markdown("---")
-st.sidebar.header("歷史行情加載區間")
+st.sidebar.header("大盤行情載入區間")
 start_default = datetime.date(2020, 1, 1)
 end_default = datetime.date.today()
 
 col_s, col_e = st.sidebar.columns(2)
-start_date = col_s.date_input("加載起日", start_default)
-end_date = col_e.date_input("加載迄日", end_default)
+start_date = col_s.date_input("大盤載入起日", start_default)
+end_date = col_e.date_input("大盤載入迄日", end_default)
 
 if start_date > end_date:
-    st.sidebar.error("加載起日不能晚於迄日！")
+    st.sidebar.error("大盤載入起日不能晚於迄日！")
     st.stop()
 
 # 2. 載入資料
@@ -75,16 +99,10 @@ if taiex_df.empty:
 
 date_to_idx = {row["Date"]: idx for idx, row in taiex_df.iterrows()}
 
-st.title("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
-
-# 3. 政策事件快速跳轉控制區
+# 3. 政策事件快速跳轉控制區（強制同列排版）
 st.subheader("政策事件快速定位")
 
 def jump_event(event_type: str, direction: int):
-    """
-    修改目的：跳轉指定政策事件的上一個或下一個。
-    防呆防錯原因：驗證事件子集是否為空，並限制游標在合法索引範圍內，避免邊界溢出。
-    """
     sub_df = events_df[events_df["type"] == event_type].sort_values("Date").reset_index(drop=True)
     if sub_df.empty:
         st.warning(f"目前無此事件資料：{event_type}")
@@ -108,53 +126,29 @@ def jump_event(event_type: str, direction: int):
         st.session_state.focus_target_idx = int(date_to_idx[target_date])
         st.session_state.focus_date_val = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
     else:
-        # 防呆：若該事件日為非交易日，對齊至最近的交易日
         future_dates = taiex_df[taiex_df["Date"] >= target_date]
         if not future_dates.empty:
             match_date = future_dates.iloc[0]["Date"]
             st.session_state.focus_target_idx = int(date_to_idx[match_date])
             st.session_state.focus_date_val = datetime.datetime.strptime(match_date, "%Y-%m-%d").date()
 
-# 佈局四組事件：名稱與「上一個／下一個」並排
-col_event_1, col_event_2 = st.columns(2)
+def render_event_buttons(title_html: str, event_key: str):
+    """將標題與上一個／下一個按鈕精確鎖定在同一橫列"""
+    c_title, c_prev, c_next = st.columns([4, 3, 3])
+    with c_title:
+        st.markdown(f"<div class='action-title'>{title_html}</div>", unsafe_allow_html=True)
+    with c_prev:
+        if st.button("上一個", key=f"prev_{event_key}", use_container_width=True):
+            jump_event(event_key, -1)
+    with c_next:
+        if st.button("下一個", key=f"next_{event_key}", use_container_width=True):
+            jump_event(event_key, 1)
 
-with col_event_1:
-    st.markdown("**:red[國安基金進場 (▲)]**")
-    b_col1, b_col2 = st.columns(2)
-    with b_col1:
-        if st.button("上一個", key="prev_nsf_auth", use_container_width=True):
-            jump_event("NSF_AUTH", -1)
-    with b_col2:
-        if st.button("下一個", key="next_nsf_auth", use_container_width=True):
-            jump_event("NSF_AUTH", 1)
-
-    st.markdown("**:orange[金管會限空令 (▲)]**")
-    b_col3, b_col4 = st.columns(2)
-    with b_col3:
-        if st.button("上一個", key="prev_short_r", use_container_width=True):
-            jump_event("SHORT_RESTRICT", -1)
-    with b_col4:
-        if st.button("下一個", key="next_short_r", use_container_width=True):
-            jump_event("SHORT_RESTRICT", 1)
-
-with col_event_2:
-    st.markdown("**:green[國安基金退場 (▼)]**")
-    b_col5, b_col6 = st.columns(2)
-    with b_col5:
-        if st.button("上一個", key="prev_nsf_exit", use_container_width=True):
-            jump_event("NSF_EXIT", -1)
-    with b_col6:
-        if st.button("下一個", key="next_nsf_exit", use_container_width=True):
-            jump_event("NSF_EXIT", 1)
-
-    st.markdown("**:blue[限空令解除 (▼)]**")
-    b_col7, b_col8 = st.columns(2)
-    with b_col7:
-        if st.button("上一個", key="prev_short_l", use_container_width=True):
-            jump_event("SHORT_LIFT", -1)
-    with b_col8:
-        if st.button("下一個", key="next_short_l", use_container_width=True):
-            jump_event("SHORT_LIFT", 1)
+# 依序渲染 4 組功能鍵（每一組內部「標題、上一個、下一個」皆在同一橫列）
+render_event_buttons("<span style='color:red;'>國安基金進場 (▲)</span>", "NSF_AUTH")
+render_event_buttons("<span style='color:green;'>國安基金退場 (▼)</span>", "NSF_EXIT")
+render_event_buttons("<span style='color:#D4AC0D;'>金管會限空令 (▲)</span>", "SHORT_RESTRICT")
+render_event_buttons("<span style='color:#2980B9;'>限空令解除 (▼)</span>", "SHORT_LIFT")
 
 if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
@@ -200,12 +194,25 @@ st.dataframe(
 
 st.markdown("---")
 
-# 6. 日期區間統計模組
+# 6. 日期區間統計模組（明確定義起訖時間）
 st.subheader("【區間統計】官股分點進出彙總分析")
 
+# 區間統計獨立時間選擇
+col_qs, col_qe = st.columns(2)
+stat_start_default = end_default - datetime.timedelta(days=30)
+stat_start = col_qs.date_input("統計起始日期", stat_start_default)
+stat_end = col_qe.date_input("統計結束日期", end_default)
+
+if stat_start > stat_end:
+    st.error("統計起始日期不可晚於結束日期！")
+    st.stop()
+
+# 明確呈現當前統計區間
+st.info(f"當前彙總統計區間：**{stat_start.strftime('%Y-%m-%d')}** 至 **{stat_end.strftime('%Y-%m-%d')}**")
+
 range_summary_df = fetch_range_gov_branch_summary(
-    start_date.strftime("%Y-%m-%d"),
-    end_date.strftime("%Y-%m-%d")
+    stat_start.strftime("%Y-%m-%d"),
+    stat_end.strftime("%Y-%m-%d")
 )
 
 tab1, tab2 = st.tabs(["各分點進出個股統計", "個股於各分點統計"])

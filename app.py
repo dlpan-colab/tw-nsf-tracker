@@ -1,15 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261109_1348
+版本識別：20261109_1410
 修改目的：
-1. 更新版本識別為 20261109_1348，介面頂部呈現最大系統版本。
-2. 配置 Plotly 圖表交互參數：啟用雙指開合/滑鼠滾輪縮放（scrollZoom=True）。
-3. 停用一切選區與框選行為，確保手勢與平移操作直覺流暢。
+1. 更新版本識別為 20261109_1410，僅於介面頂端顯示最大系統版本。
+2. 注入強制 CSS 樣式：徹底消除 Plotly 的灰色選取遮罩圖層（.select-outline, .selectionlayer），杜絕拉桿遮罩再現。
+3. 鎖定按鈕列在手機端同列橫排。
+4. 設定圖表雙指縮放與單指平移。
 防呆防錯原因：
-1. 傳入 showAxisDragHandles=False，防止滑鼠/觸控摸到坐標軸邊界時意外觸發軸拉伸。
+1. 透過 CSS 徹底屏蔽選取圖層，避免手機端手勢誤觸發的選取反灰。
 """
 
-MODULE_VERSION = "20261109_1348"
+MODULE_VERSION = "20261109_1410"
 
 import streamlit as st
 import datetime
@@ -35,9 +36,10 @@ SYSTEM_VERSION = max(all_versions)
 
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# CSS 深度穿透：鎖定按鈕列同列橫排
+# CSS 深度穿透：強制按鈕同列橫排 ＋ 徹底隱藏任何 Plotly 選取遮罩圖層
 st.markdown("""
 <style>
+/* 按鈕容器橫向同列排版，手機寬度下禁止折行 */
 div[data-testid="stHorizontalBlock"] {
     flex-wrap: nowrap !important;
     gap: 6px !important;
@@ -51,6 +53,18 @@ div[data-testid="stHorizontalBlock"] > div {
     font-size: 14px;
     font-weight: bold;
     white-space: nowrap;
+}
+
+/* 【關鍵修改】直接從前端 DOM 強制隱藏 Plotly 的選取遮罩、白線拉桿與選區矩形 */
+.selectionlayer,
+.select-outline,
+.select-box,
+g.select-outline,
+rect.select-outline {
+    display: none !important;
+    opacity: 0 !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -150,7 +164,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（徹底關閉選取手柄，開啟純平移與滾輪/手勢縮放）
+# 4. 繪製圖表（配置單指平移、雙指開合縮放、徹底停用選取工具）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
@@ -161,10 +175,19 @@ st.plotly_chart(
     chart_fig,
     use_container_width=True,
     config={
-        "scrollZoom": True,                # 雙指開合 / 滑鼠滾輪縮放
-        "displayModeBar": False,           # 隱藏工具列，避免手機觸控誤切換
-        "showAxisDragHandles": False,      # 停用坐標軸邊緣手柄
-        "showAxisRangeEntryBoxes": False   # 停用手動輸入框
+        "scrollZoom": True,
+        "displayModeBar": False,
+        "showAxisDragHandles": False,
+        "showAxisRangeEntryBoxes": False,
+        "modeBarButtonsToRemove": [
+            "select2d",
+            "lasso2d",
+            "zoom2d",
+            "zoomIn2d",
+            "zoomOut2d",
+            "autoScale2d",
+            "resetScale2d"
+        ]
     }
 )
 

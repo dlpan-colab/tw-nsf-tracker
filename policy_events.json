@@ -1,0 +1,58 @@
+[
+  {
+    "date": "2020-03-19",
+    "type": "NSF_AUTH",
+    "name": "國安基金授權進場",
+    "marker": "triangle-up",
+    "color": "red",
+    "description": "第7次護盤授權進場（疫情恐慌）"
+  },
+  {
+    "date": "2020-10-12",
+    "type": "NSF_EXIT",
+    "name": "國安基金解除授權",
+    "marker": "triangle-down",
+    "color": "green",
+    "description": "第7次護盤任務結束退場"
+  },
+  {
+    "date": "2022-07-12",
+    "type": "NSF_AUTH",
+    "name": "國安基金授權進場",
+    "marker": "triangle-up",
+    "color": "red",
+    "description": "第8次護盤授權進場（俄烏戰爭與通膨升息）"
+  },
+  {
+    "date": "2022-10-01",
+    "type": "SHORT_RESTRICT",
+    "name": "金管會實施限空令",
+    "marker": "triangle-up",
+    "color": "#F4D03F",
+    "description": "調降借券賣出委託數量限額、調升融券保證金成數"
+  },
+  {
+    "date": "2022-10-21",
+    "type": "SHORT_RESTRICT",
+    "name": "金管會實施限空令",
+    "marker": "triangle-up",
+    "color": "#F4D03F",
+    "description": "跌幅逾3.5%隔日平盤下禁止放空"
+  },
+  {
+    "date": "2023-02-23",
+    "type": "SHORT_LIFT",
+    "name": "金管會解除限空令",
+    "marker": "triangle-down",
+    "color": "#2980B9",
+    "description": "取消平盤下禁止放空及相關保證金成數限制"
+  },
+  {
+    "date": "2023-04-13",
+    "type": "NSF_EXIT",
+    "name": "國安基金解除授權",
+    "marker": "triangle-down",
+    "color": "green",
+    "description": "第8次護盤任務結束退場"
+  }
+]

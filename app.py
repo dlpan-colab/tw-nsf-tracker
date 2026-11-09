@@ -1,16 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261109_1311
+版本識別：20261109_1325
 修改目的：
-1. 自動讀取各模組之 MODULE_VERSION 並計算最大值，僅於畫面頂部呈現「系統版本識別」。
-2. 徹底解決「上一個／下一個」功能鍵折行問題：使用自適應 flexbox 按鈕容器排版，保證在手機窄螢幕上仍維持同列緊湊顯示。
-3. 明確標示「區間統計」的具體起訖日期，並提供獨立自訂時間範圍。
+1. 系統名稱字體改用 st.subheader，大小與「政策事件快速定位」完全同級。
+2. 傳入 config={"scrollZoom": True}，允許雙指開合或滑鼠滾輪進行直覺放大縮小。
+3. 頂部僅呈現系統版本識別（取各模組版本最大值）。
 防呆防錯原因：
-1. 取最大版本時加入空值回退機制，避免版本變數缺失引發 AttributeError。
-2. 注入精確 CSS 覆蓋 Streamlit 行動端自動折行行為（flex-direction: row !important）。
+1. 限制圖表滾輪縮放與平移配置，避免觸控時觸發全螢幕放大或瀏覽器預設滾動衝突。
+2. 維護事件索引防呆界限，確保按鈕跳轉不引發 IndexError。
 """
 
-MODULE_VERSION = "20261109_1311"
+MODULE_VERSION = "20261109_1325"
 
 import streamlit as st
 import datetime
@@ -36,10 +36,9 @@ SYSTEM_VERSION = max(all_versions)
 
 st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-# CSS 深度穿透：強制手機螢幕上的按鈕容器保持水平同列
+# CSS 深度穿透：鎖定按鈕列同列橫排
 st.markdown("""
 <style>
-/* 強制自訂按鈕列保持橫向同列排版，手機寬度下禁止折行 */
 div[data-testid="stHorizontalBlock"] {
     flex-wrap: nowrap !important;
     gap: 6px !important;
@@ -59,7 +58,9 @@ div[data-testid="stHorizontalBlock"] > div {
 
 # 僅顯示系統版本識別
 st.caption(f"系統版本識別：{SYSTEM_VERSION}")
-st.title("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
+
+# 修改目的：系統名稱縮小至與政策事件定位相同層級（採用 st.subheader）
+st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
 # 1. 初始化 Session State
 if "focus_target_idx" not in st.session_state:
@@ -99,7 +100,7 @@ if taiex_df.empty:
 
 date_to_idx = {row["Date"]: idx for idx, row in taiex_df.iterrows()}
 
-# 3. 政策事件快速跳轉控制區（強制同列排版）
+# 3. 政策事件快速跳轉控制區
 st.subheader("政策事件快速定位")
 
 def jump_event(event_type: str, direction: int):
@@ -133,7 +134,6 @@ def jump_event(event_type: str, direction: int):
             st.session_state.focus_date_val = datetime.datetime.strptime(match_date, "%Y-%m-%d").date()
 
 def render_event_buttons(title_html: str, event_key: str):
-    """將標題與上一個／下一個按鈕精確鎖定在同一橫列"""
     c_title, c_prev, c_next = st.columns([4, 3, 3])
     with c_title:
         st.markdown(f"<div class='action-title'>{title_html}</div>", unsafe_allow_html=True)
@@ -144,7 +144,6 @@ def render_event_buttons(title_html: str, event_key: str):
         if st.button("下一個", key=f"next_{event_key}", use_container_width=True):
             jump_event(event_key, 1)
 
-# 依序渲染 4 組功能鍵（每一組內部「標題、上一個、下一個」皆在同一橫列）
 render_event_buttons("<span style='color:red;'>國安基金進場 (▲)</span>", "NSF_AUTH")
 render_event_buttons("<span style='color:green;'>國安基金退場 (▼)</span>", "NSF_EXIT")
 render_event_buttons("<span style='color:#D4AC0D;'>金管會限空令 (▲)</span>", "SHORT_RESTRICT")
@@ -154,14 +153,22 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表
+# 4. 繪製圖表（啟用 scrollZoom=True 支援雙指開合/滾輪縮放，搭配 dragmode="pan" 進行單指平移）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
     display_bars=display_days,
     target_date_idx=st.session_state.focus_target_idx
 )
-st.plotly_chart(chart_fig, use_container_width=True)
+st.plotly_chart(
+    chart_fig,
+    use_container_width=True,
+    config={
+        "scrollZoom": True,            # 修改目的：開啟雙指開合/滑鼠滾輪放大縮小
+        "displayModeBar": True,
+        "modeBarButtonsToRemove": ["select2d", "lasso2d"]  # 防呆防錯：移除選框工具，避免誤切成選框模式
+    }
+)
 
 st.markdown("---")
 
@@ -194,10 +201,9 @@ st.dataframe(
 
 st.markdown("---")
 
-# 6. 日期區間統計模組（明確定義起訖時間）
+# 6. 日期區間統計模組
 st.subheader("【區間統計】官股分點進出彙總分析")
 
-# 區間統計獨立時間選擇
 col_qs, col_qe = st.columns(2)
 stat_start_default = end_default - datetime.timedelta(days=30)
 stat_start = col_qs.date_input("統計起始日期", stat_start_default)
@@ -207,7 +213,6 @@ if stat_start > stat_end:
     st.error("統計起始日期不可晚於結束日期！")
     st.stop()
 
-# 明確呈現當前統計區間
 st.info(f"當前彙總統計區間：**{stat_start.strftime('%Y-%m-%d')}** 至 **{stat_end.strftime('%Y-%m-%d')}**")
 
 range_summary_df = fetch_range_gov_branch_summary(

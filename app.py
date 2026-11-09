@@ -1,15 +1,15 @@
 """
 模組名稱：app.py
-版本識別：20261109_1340
+版本識別：20261109_1348
 修改目的：
-1. 更新版本識別為 20261109_1340，頂部顯示最大系統版本。
-2. 配置完整 Plotly Config，移除任何可能引發選區的工具，並啟用雙指/滾輪縮放（scrollZoom=True）。
-3. 嚴格鎖定 ModeBar 預設模式為平移（pan2d）。
+1. 更新版本識別為 20261109_1348，介面頂部呈現最大系統版本。
+2. 配置 Plotly 圖表交互參數：啟用雙指開合/滑鼠滾輪縮放（scrollZoom=True）。
+3. 停用一切選區與框選行為，確保手勢與平移操作直覺流暢。
 防呆防錯原因：
-1. 停用 select、lasso、boxzoom 等選區模式，防止手機單指滑動時觸發灰色遮罩。
+1. 傳入 showAxisDragHandles=False，防止滑鼠/觸控摸到坐標軸邊界時意外觸發軸拉伸。
 """
 
-MODULE_VERSION = "20261109_1340"
+MODULE_VERSION = "20261109_1348"
 
 import streamlit as st
 import datetime
@@ -150,7 +150,7 @@ if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
     st.session_state.focus_date_val = datetime.date.today()
 
-# 4. 繪製圖表（鎖定單指水平平移、雙指開合縮放、徹底移除遮罩拉桿）
+# 4. 繪製圖表（徹底關閉選取手柄，開啟純平移與滾輪/手勢縮放）
 chart_fig = build_taiex_chart(
     taiex_df,
     events_df,
@@ -161,10 +161,10 @@ st.plotly_chart(
     chart_fig,
     use_container_width=True,
     config={
-        "scrollZoom": True,
-        "displayModeBar": False,   # 防呆防錯：直接關閉工具列，避免手機觸控誤切為選區模式
-        "showAxisDragHandles": False,
-        "showAxisRangeEntryBoxes": False
+        "scrollZoom": True,                # 雙指開合 / 滑鼠滾輪縮放
+        "displayModeBar": False,           # 隱藏工具列，避免手機觸控誤切換
+        "showAxisDragHandles": False,      # 停用坐標軸邊緣手柄
+        "showAxisRangeEntryBoxes": False   # 停用手動輸入框
     }
 )
 

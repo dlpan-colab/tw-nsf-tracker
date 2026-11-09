@@ -1,18 +1,16 @@
 """
 模組名稱：data_loader.py
-版本識別：20261109_2308
+版本識別：20261109_2310
 修改目的：
-1. 更新版本識別為 20261109_2308。
-2. 廢除會被防爬蟲攔截的玩股網端點，改採臺灣證券交易所 (TWSE) 官方 OpenAPI / 盤後歷史查詢端點。
-3. 支援任意指定歷史交易日（如 11/03、11/06），徹底根絕查無歷史官股排行之問題。
-4. 將查詢成功的真實數據持久化寫入本地快取並同步至 Google Drive (NSF-tracker/gov_trades_history.csv)。
-5. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '買賣超金額(萬元)']。
+1. 更新版本識別為 20261109_2310。
+2. 輸出欄位更名：「買賣超金額(萬元)」改為「金額(萬元)」。
+3. 欄位架構維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+4. 維持證交所官方盤後端點串接與 Google Drive 同步機制。
 防呆防錯原因：
-1. 針對證交所官方回傳 JSON 進行欄位型別驗證與逗號清洗，防範字串轉浮點數例外。
-2. 查詢歷史日期優先檢索本地與雲端歷史資料庫，減少對證交所端點之請求次數，防範頻率限制。
+1. 資料欄位更名保持全域一致，避免與 app.py 產生 KeyError。
 """
 
-MODULE_VERSION = "20261109_2308"
+MODULE_VERSION = "20261109_2310"
 
 import os
 import json
@@ -35,7 +33,7 @@ GOV_BANKS = [
 
 EMPTY_TRADE_COLUMNS = [
     "交易日期", "官股分點", "代號", "名稱",
-    "買進張數", "賣出張數", "買賣超張數", "買賣超金額(萬元)"
+    "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"
 ]
 
 @st.cache_data(ttl=3600)
@@ -103,7 +101,6 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _clean_num(val) -> float:
-    """清除字串逗號並轉為浮點數防呆函式"""
     if pd.isnull(val):
         return 0.0
     s = str(val).replace(",", "").strip()
@@ -119,8 +116,6 @@ def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01"
     }
-    
-    # 證交所官方盤後交易排行 (含當日各大機構進出)
     twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_compact}&selectType=ALLBUT0999&response=json"
     records = []
     
@@ -134,11 +129,9 @@ def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
                     if len(row) >= 19:
                         stock_code = str(row[0]).strip()
                         stock_name = str(row[1]).strip()
-                        # 官方三大法人買賣張數換算
                         buy_vol = int(_clean_num(row[2]) / 1000)
                         sell_vol = int(_clean_num(row[3]) / 1000)
                         net_vol = int(_clean_num(row[4]) / 1000)
-                        # 估算成交金額（萬元）
                         net_amt = round(_clean_num(row[4]) * 0.01, 2)
                         
                         records.append({
@@ -149,7 +142,7 @@ def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
                             "買進張數": buy_vol,
                             "賣出張數": sell_vol,
                             "買賣超張數": net_vol,
-                            "買賣超金額(萬元)": net_amt
+                            "金額(萬元)": net_amt
                         })
     except Exception as e:
         print(f"[data_loader] 證交所官方端點請求失敗: {e}")
@@ -161,25 +154,27 @@ def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
 @st.cache_data(ttl=1800)
 def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
     """取得真實分點交易資料，具備本機快取與雲端同步機制"""
-    # 1. 優先嘗試由本地與 Google Drive 歷史庫檢索
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
         
     if os.path.exists(LOCAL_GOV_FILE):
         try:
             cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
+                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
             match_rows = cached_db[cached_db["交易日期"] == trade_date]
             if not match_rows.empty:
                 return match_rows
         except Exception:
             pass
 
-    # 2. 本地查無紀錄，即時向證交所官方端點查詢
     new_df = _query_twse_gov_ranking(trade_date)
     if not new_df.empty:
         try:
             if os.path.exists(LOCAL_GOV_FILE):
                 existing_df = pd.read_csv(LOCAL_GOV_FILE)
+                if "買賣超金額(萬元)" in existing_df.columns and "金額(萬元)" not in existing_df.columns:
+                    existing_df = existing_df.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
                 combined = pd.concat([existing_df, new_df], ignore_index=True)
                 combined = combined.drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
             else:
@@ -201,6 +196,8 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFra
     if os.path.exists(LOCAL_GOV_FILE):
         try:
             cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
+                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
             if not cached_db.empty and "交易日期" in cached_db.columns:
                 mask = (cached_db["交易日期"] >= start_date) & (cached_db["交易日期"] <= end_date)
                 return cached_db[mask]

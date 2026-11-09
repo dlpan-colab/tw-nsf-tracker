@@ -1,20 +1,18 @@
 """
 模組名稱：chart_builder.py
-版本識別：20261109_1435
+版本識別：20261109_1510
 修改目的：
-1. 更新版本識別為 20261109_1435。
-2. 徹底根絕灰底遮罩與白拉桿：
-   - 廢除所有帶有 rangeslider 字典的 update 語句。
-   - 在圖表回傳前，從底層 layout 結構徹底將 xaxis 及 xaxis2 的 rangeslider 鍵值以 del 抹除，使前端 Plotly.js 完全不產生該 DOM 元件。
-3. 嚴格取消 K 線與成交量之浮動標籤（hoverinfo="none"、hovermode=False）。
-4. 預設 dragmode="pan"，限定 X 軸單指/滑鼠平移，Y 軸絕對垂直鎖定（fixedrange=True）。
-5. 最新交易日緊貼右側邊際不留白。
+1. 更新版本識別為 20261109_1510。
+2. 回歸標準金融繪圖架構，產出結構完整的 go.Candlestick。
+3. 嚴格取消 K 線上浮動標籤（hoverinfo="none"、hovertemplate=None）。
+4. 鎖定 Y 軸不可手動上下拖拉（fixedrange=True），X 軸保留水平平移能力。
+5. 起訖區間精準設定，右端貼齊最新交易日。
 防呆防錯原因：
-1. go.Candlestick 在多子圖 shared_xaxes 下會強制補償 rangeslider 結構，唯有在 JSON 根層級以 dict.pop 徹底拔除才能防止前端重新渲染滑桿。
-2. 所有價量欄位強制透過 pd.to_numeric 轉型，避免極值計算因型態衝突崩潰。
+1. 數值欄位全部強制轉換為 float，防止空值與型別衝突引發 Plotly 序列化失敗。
+2. 設定 rangebreaks 移除週末休市空檔，維持走勢連續性。
 """
 
-MODULE_VERSION = "20261109_1435"
+MODULE_VERSION = "20261109_1510"
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -43,7 +41,7 @@ def build_taiex_chart(
         if col in df_market.columns:
             df_market[col] = pd.to_numeric(df_market[col], errors="coerce")
 
-    # 1. 計算切片起訖整數索引
+    # 1. 計算切片整數索引界限
     if target_date_idx is None or target_date_idx >= total_bars:
         end_idx = total_bars - 1
         start_idx = max(0, end_idx - int(display_bars) + 1)
@@ -53,7 +51,7 @@ def build_taiex_chart(
         end_idx = min(total_bars - 1, start_idx + int(display_bars) - 1)
         start_idx = max(0, end_idx - int(display_bars) + 1)
 
-    # 2. 自適應 Y 軸高低界限
+    # 2. 自適應 Y 軸初始極值計算
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
@@ -79,7 +77,8 @@ def build_taiex_chart(
             name="加權指數",
             increasing_line_color="#E74C3C",
             decreasing_line_color="#2ECC71",
-            hoverinfo="none"
+            hoverinfo="none",
+            hovertemplate=None
         ),
         row=1, col=1
     )
@@ -97,7 +96,8 @@ def build_taiex_chart(
             marker_color=vol_colors,
             name="成交量",
             opacity=0.65,
-            hoverinfo="none"
+            hoverinfo="none",
+            hovertemplate=None
         ),
         row=2, col=1
     )
@@ -145,7 +145,7 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
-    # 鎖定 Y 軸不隨平移上下跳動
+    # 鎖定 Y 軸不隨手勢拖動上下位移
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -153,7 +153,7 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 設定 X 軸起訖範圍與排除週末
+    # 設定 X 軸原生時間軸並排除週末休市
     fig.update_xaxes(
         type="date",
         range=[start_date_str, end_date_str],
@@ -168,12 +168,5 @@ def build_taiex_chart(
         rangebreaks=[dict(bounds=["sat", "mon"])],
         row=2, col=1
     )
-
-    # 【防呆關鍵修正】：從底層 JSON 資料結構徹底刪除 rangeslider 節點，防止前端重建
-    fig_dict = fig.to_dict()
-    layout_data = fig_dict.get("layout", {})
-    for axis_key in ["xaxis", "xaxis2"]:
-        if axis_key in layout_data and "rangeslider" in layout_data[axis_key]:
-            layout_data[axis_key]["rangeslider"] = {"visible": False}
-
-    return go.Figure(fig_dict)
+    
+    return fig

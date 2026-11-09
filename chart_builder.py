@@ -1,13 +1,13 @@
 """
 模組名稱：chart_builder.py
 修改目的：
-1. 解決 TypeError：因 X 軸為 category（文字日期）型別，避免使用浮點數索引傳入 range，改直接傳入對應的日期字串範圍。
-2. 數值計算防呆：強制將 High, Low, Volume 透過 pd.to_numeric 轉換為浮點數，防止 yfinance 抓取之欄位型態異常引發計算錯誤。
-3. 嚴格鎖定 Y 軸（fixedrange=True），僅開放 X 軸橫向平移。
-4. 當顯示區間包含最新交易日時，右側緊貼邊界不留空白。
+1. 徹底根治 TypeError：Plotly 在 category 型別軸下，range 必須使用純整數索引（int），不可傳入字串。
+2. 鎖定 Y 軸不允許垂直拖曳移動（fixedrange=True），僅開放 X 軸水平平移。
+3. 依據目前可視區間的最高與最低價，自動計算 Y 軸 range。
+4. 當顯示區間包含最新交易日時，X 軸右端精準貼齊最後一筆資料，右側絕不留空白。
 防呆防錯原因：
-1. 切片索引嚴格限制在 0 至 len(df_market)-1 之間，杜絕 IndexError。
-2. 計算 Y 軸極值時剔除 NaN 與 Inf，防止 Plotly 繪圖座標軸崩潰。
+1. 強制將 High, Low, Volume 轉換為 float 原生數值，防止含有文字、None 或空值引發運算異常。
+2. 索引範圍使用 min/max 夾在 0 與 len(df_market)-1 之間，防止越界或負數索引引發 Plotly 內部減法崩潰。
 """
 
 import pandas as pd
@@ -21,8 +21,10 @@ def build_taiex_chart(
     target_date_idx: int = None
 ) -> go.Figure:
     """
-    修改目的：繪製加權指數 K 線與標記成交量，並確保 X 軸字串切片與 Y 軸動態縮放正常運作。
-    防呆防錯原因：以日期字串作為 X 軸 category 的 range 邊界，徹底排除 TypeError。
+    修改目的：繪製加權指數 K 線與政策三角形標記成交量圖。
+    防呆防錯原因：
+    - category 軸的 range 嚴格使用整數索引 float/int（如 [start_idx - 0.5, end_idx + 0.5]）。
+    - 排除 string 相減之 TypeError。
     """
     fig = make_subplots(
         rows=2, cols=1,
@@ -36,25 +38,24 @@ def build_taiex_chart(
     if total_bars == 0:
         return fig
 
-    # 防呆防錯：確保數值欄位均為 float 型別
+    # 欄位型態數值化防呆
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         if col in df_market.columns:
             df_market[col] = pd.to_numeric(df_market[col], errors="coerce")
 
-    # 1. 計算切片起訖索引
+    # 1. 計算切片整數索引界限
     if target_date_idx is None or target_date_idx >= total_bars:
-        # 預設錨定在最後一筆（右側邊界無空白）
+        # 預設對齊最後一筆交易日（右側緊貼邊緣）
         end_idx = total_bars - 1
-        start_idx = max(0, end_idx - display_bars + 1)
+        start_idx = max(0, end_idx - int(display_bars) + 1)
     else:
-        # 錨定在指定事件日期
-        half = display_bars // 2
-        start_idx = max(0, target_date_idx - half)
-        end_idx = min(total_bars - 1, start_idx + display_bars - 1)
-        # 若推至最右端，反推起點維持指定天數
-        start_idx = max(0, end_idx - display_bars + 1)
+        # 錨定在指定事件日期附近
+        half = int(display_bars) // 2
+        start_idx = max(0, int(target_date_idx) - half)
+        end_idx = min(total_bars - 1, start_idx + int(display_bars) - 1)
+        start_idx = max(0, end_idx - int(display_bars) + 1)
 
-    # 2. 動態計算顯示區間的 Y 軸最高/最低價（自適應極值）
+    # 2. 計算目前視圖區間 Y 軸上下界（自適應極值）
     visible_slice = df_market.iloc[start_idx : end_idx + 1]
     if not visible_slice.empty:
         valid_low = visible_slice["Low"].dropna()
@@ -78,8 +79,8 @@ def build_taiex_chart(
             low=df_market["Low"],
             close=df_market["Close"],
             name="加權指數",
-            increasing_line_color="#E74C3C",
-            decreasing_line_color="#2ECC71"
+            increasing_line_color="#E74C3C",  # 台股紅漲
+            decreasing_line_color="#2ECC71"   # 台股綠跌
         ),
         row=1, col=1
     )
@@ -101,7 +102,7 @@ def build_taiex_chart(
         row=2, col=1
     )
 
-    # 5. 疊加成交量之政策事件三角形標記
+    # 5. 疊加成交量之政策事件標記
     if not df_events.empty and "Date" in df_events.columns and "Date" in df_market.columns:
         merged = pd.merge(df_events, df_market[["Date", "Volume"]], on="Date", how="inner")
         
@@ -132,7 +133,7 @@ def build_taiex_chart(
                     row=2, col=1
                 )
 
-    # 6. 配置座標軸限制：固定 Y 軸不允許上下移動，僅開放 X 軸水平平移
+    # 6. 配置座標軸限制：固定 Y 軸不允許垂直拖曳移動，僅開放 X 軸水平平移
     fig.update_layout(
         xaxis_rangeslider_visible=False,
         height=720,
@@ -141,6 +142,7 @@ def build_taiex_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
 
+    # 鎖定 Y 軸（fixedrange=True 確保不可上下拖曳）
     if price_y_range:
         fig.update_yaxes(range=price_y_range, fixedrange=True, row=1, col=1)
     else:
@@ -148,18 +150,17 @@ def build_taiex_chart(
 
     fig.update_yaxes(fixedrange=True, row=2, col=1)
 
-    # 防呆修正：以 category 型別之「日期字串」直接指定起訖範圍，杜絕 TypeError
-    x_start_str = str(df_market.iloc[start_idx]["Date"])
-    x_end_str = str(df_market.iloc[end_idx]["Date"])
+    # 【防呆關鍵修正】：Plotly category 軸的 range 必須給整數/浮點數索引，右端貼合最新一筆
+    x_range_bounds = [start_idx - 0.5, end_idx + 0.5]
 
     fig.update_xaxes(
         type="category",
-        range=[x_start_str, x_end_str],
+        range=x_range_bounds,
         row=1, col=1
     )
     fig.update_xaxes(
         type="category",
-        range=[x_start_str, x_end_str],
+        range=x_range_bounds,
         row=2, col=1
     )
     

@@ -1,8 +1,8 @@
 """
 模組名稱：frontend.py
-版本識別：20261109_2155
+版本識別：20261109_2238
 修改目的：
-1. 更新版本識別為 20261109_2155。
+1. 更新版本識別為 20261109_2238。
 2. 根絕資訊條 NaN 問題：直接接收 Python 端序列化的乾淨陣列（dates, opens, highs, lows, closes, volumes, turnover），由 JS 直接依索引取值。
 3. 資訊條完整呈現「開／高／低／收／成交值（億元）」。
 4. 徹底修復 Y 軸自適應：在 plotly_relayout 內動態計算可視範圍 High/Low 極值與成交量極值，透過 Plotly.relayout 強制覆蓋 yaxis.range 與 yaxis2.range，徹底解決 37K 以下被截斷與副圖上方過度留白。
@@ -12,7 +12,7 @@
 2. 切片索引強制 Math.floor 與 Math.ceil 邊界保護，杜絕陣列越界。
 """
 
-MODULE_VERSION = "20261109_2155"
+MODULE_VERSION = "20261109_2238"
 
 import json
 import streamlit.components.v1 as components

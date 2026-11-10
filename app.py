@@ -1,22 +1,20 @@
 """
 模組名稱：app.py
-版本識別：20261110_0110
+版本識別：20261110_1010
 修改目的：
-1. 更新版本識別為 20261110_0110。
-2. 側邊欄獨立增設「資料庫維護與真實回補」功能區：
-   - 按鈕【🗑️ 清除污染歷史資料庫】：手動確認後安全清空舊資料庫。
-   - 回補天數滑桿（可選 3 ~ 30 天）與按鈕【⚡ 執行真實官股歷史回補】：手動按需觸發並配合進度條回報。
-3. 區間統計日常操作改為「純讀取模式」，絕不在背後自動偷偷替換或填補任何偽造資料。
-4. 維持無名次欄位、張數在金額之前、選單排除 0 張且買賣超雙向排序、合計走勢圖與 5 大分點每日走勢圖。
+1. 更新版本識別為台灣時間 20261110_1010。
+2. 全面導入 zoneinfo (Asia/Taipei)，大盤日曆與預設選單皆依台灣標準時間對齊。
+3. 側邊欄「執行真實官股回補」提供前台即時診斷與落盤回報，操作日誌公開透明。
+4. 維持嚴格的日常純讀取原則，絕不私自捏造資料。
 防呆防錯原因：
-1. 清除舊資料庫前使用警示提示，避免誤觸。
-2. 回補完成後即時執行 st.rerun()，確保全頁面無痛讀取最新乾淨資料。
+1. 回補成功後顯示抓取到的實際交易日期與總筆數，並自動 st.rerun() 刷新全域快取。
 """
 
-MODULE_VERSION = "20261110_0110"
+MODULE_VERSION = "20261110_1010"
 
 import streamlit as st
 import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import data_loader
@@ -29,8 +27,10 @@ from data_loader import (
     fetch_gov_branch_trades,
     fetch_range_gov_branch_summary,
     purge_gov_database,
-    backfill_real_gov_trades,
-    GOV_BANKS
+    fetch_histock_latest_gov_trades,
+    sync_df_to_storage,
+    GOV_BANKS,
+    get_tw_today
 )
 from chart_builder import build_taiex_chart
 from frontend import render_interactive_chart
@@ -65,14 +65,16 @@ div[data-testid="stHorizontalBlock"] > div {
 </style>
 """, unsafe_allow_html=True)
 
-st.caption(f"系統版本識別：{SYSTEM_VERSION}")
+st.caption(f"系統版本識別（台灣時間）：{SYSTEM_VERSION}")
 st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
-# 1. 初始化 Session State
+# 1. 初始化 Session State（強制綁定台灣時區）
+today_tw = get_tw_today()
+
 if "focus_target_idx" not in st.session_state:
     st.session_state.focus_target_idx = None
 if "focus_date_val" not in st.session_state:
-    st.session_state.focus_date_val = datetime.date.today()
+    st.session_state.focus_date_val = today_tw
 
 for key in ["idx_NSF_AUTH", "idx_NSF_EXIT", "idx_SHORT_RESTRICT", "idx_SHORT_LIFT"]:
     if key not in st.session_state:
@@ -85,7 +87,7 @@ display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_val
 st.sidebar.markdown("---")
 st.sidebar.header("大盤行情載入區間")
 start_default = datetime.date(2000, 1, 1)
-end_default = datetime.date.today()
+end_default = today_tw
 
 col_s, col_e = st.sidebar.columns(2)
 start_date = col_s.date_input("大盤載入起日", start_default)
@@ -99,30 +101,21 @@ if start_date > end_date:
 st.sidebar.markdown("---")
 st.sidebar.header("官股資料維護與回補")
 
-backfill_days = st.sidebar.slider("回補缺失天數設定", min_value=3, max_value=30, value=10, step=1)
+if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_container_width=True):
+    with st.spinner("正在對接 HiStock 八大官股日報端點..."):
+        df_real, actual_d, status_msg = fetch_histock_latest_gov_trades()
+        if not df_real.empty:
+            ok = sync_df_to_storage(df_real)
+            if ok:
+                st.session_state.focus_date_val = datetime.datetime.strptime(actual_d, "%Y-%m-%d").date()
+                st.sidebar.success(f"【成功入庫】已取得 {actual_d} 共 {len(df_real)} 筆官股資料！")
+                st.rerun()
+            else:
+                st.sidebar.error("寫入 Google Drive 失敗，請檢查憑證。")
+        else:
+            st.sidebar.error(f"抓取失敗：{status_msg}")
 
-if st.sidebar.button("⚡ 執行真實官股歷史回補", use_container_width=True):
-    p_bar = st.sidebar.progress(0.0)
-    status_text = st.sidebar.empty()
-    
-    def on_progress(percent, day_str):
-        p_bar.progress(percent)
-        status_text.text(f"正在抓取 {day_str} 八大官股分點...")
-
-    with st.spinner("正在自 FinMind 逐日抓取真實八大官股分點數據..."):
-        stat_s = end_default - datetime.timedelta(days=backfill_days * 2)
-        added_count = backfill_real_gov_trades(
-            stat_s.strftime("%Y-%m-%d"),
-            end_default.strftime("%Y-%m-%d"),
-            max_days=backfill_days,
-            progress_cb=on_progress
-        )
-    p_bar.progress(1.0)
-    status_text.empty()
-    st.sidebar.success(f"回補完成！成功入庫 {added_count} 個交易日的真實官股分點資料。")
-    st.rerun()
-
-if st.sidebar.button("🗑️ 清除污染歷史資料庫", use_container_width=True):
+if st.sidebar.button("🗑️ 清除歷史資料庫", use_container_width=True):
     if purge_gov_database():
         st.sidebar.success("已成功清空本機與雲端舊資料庫！")
         st.rerun()
@@ -191,7 +184,7 @@ render_event_buttons("<span style='color:#2980B9;'>限空令解除 (▼)</span>"
 
 if st.button("重設回最新交易日視圖", use_container_width=True):
     st.session_state.focus_target_idx = None
-    st.session_state.focus_date_val = datetime.date.today()
+    st.session_state.focus_date_val = today_tw
 
 # 4. 繪製大盤圖表
 chart_fig = build_taiex_chart(
@@ -204,7 +197,7 @@ render_interactive_chart(chart_fig, taiex_df, height=580)
 
 st.markdown("---")
 
-# 5. 指定交易日官股分點檢視（買超前 30 名 / 賣超前 30 名）
+# 5. 指定交易日官股分點檢視
 st.subheader("【指定交易日】八大官股分點買賣超標的排名")
 
 col_sel_date, col_sel_bank = st.columns(2)
@@ -218,7 +211,7 @@ single_day_df = fetch_gov_branch_trades(focus_date.strftime("%Y-%m-%d"))
 DISPLAY_COLS = ["代號", "名稱", "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"]
 
 if single_day_df.empty:
-    st.info(f"{focus_date.strftime('%Y-%m-%d')} 目前資料庫尚無該日真實官股紀錄。若需補充，請於左側欄點擊「執行真實官股歷史回補」。")
+    st.info(f"{focus_date.strftime('%Y-%m-%d')} 目前資料庫尚無該日真實官股紀錄。若需補充，請於左側欄點擊「⚡ 抓取 HiStock 最新真實官股結算」。")
 else:
     if selected_bank != "全部官股合計":
         day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
@@ -261,9 +254,9 @@ st.markdown("---")
 st.subheader("【區間統計】官股分點進出彙總分析")
 
 col_qs, col_qe = st.columns(2)
-stat_start_default = end_default - datetime.timedelta(days=30)
+stat_start_default = today_tw - datetime.timedelta(days=30)
 stat_start = col_qs.date_input("統計起始日期", stat_start_default)
-stat_end = col_qe.date_input("統計結束日期", end_default)
+stat_end = col_qe.date_input("統計結束日期", today_tw)
 
 if stat_start > stat_end:
     st.error("統計起始日期不可晚於結束日期！")
@@ -277,13 +270,12 @@ range_summary_df = fetch_range_gov_branch_summary(
 )
 
 if range_summary_df.empty:
-    st.info("所選統計區間內查無官股進出紀錄。請先於左側側邊欄設定回補天數並點擊「⚡ 執行真實官股歷史回補」。")
+    st.info("所選統計區間內查無官股進出紀錄。請先於左側側邊欄點擊「⚡ 抓取 HiStock 最新真實官股結算」。")
 else:
     tab_branch, tab_stock = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
 
     with tab_branch:
         st.markdown("**各官股分點於所選區間買賣各個股明細（買賣超張數）：**")
-        # 排除聚合列，只顯示真實券商分點
         real_branches_only = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
         if not real_branches_only.empty:
             pivot_branch = pd.pivot_table(
@@ -299,7 +291,6 @@ else:
             st.info("目前資料庫尚無實體分點明細。")
 
     with tab_stock:
-        # 透視表：代號、名稱為 index，官股分點為 columns
         real_stock_subset = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
         if not real_stock_subset.empty:
             pivot_stock = pd.pivot_table(
@@ -376,7 +367,6 @@ else:
             # 1. 全部官股合計走勢圖
             total_stock_df = target_stock_df[target_stock_df["官股分點"] == "全部官股合計"].sort_values("交易日期")
             if total_stock_df.empty:
-                # 由真實分點每日聚合
                 total_stock_df = target_stock_df.groupby("交易日期", as_index=False)["買賣超張數"].sum().sort_values("交易日期")
 
             if not total_stock_df.empty:

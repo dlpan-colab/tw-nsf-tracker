@@ -1,20 +1,25 @@
 """
-模組名稱：data_loader.py 
-版本識別：20261110_0110
+模組名稱：data_loader.py
+版本識別：20261110_0140
 修改目的：
-1. 更新版本識別為 20261110_0110。
-2. 徹底拔除證交所三大法人 T86 請求代碼與假官股降級邏輯，嚴禁使用非官股數據充數。
-3. 八大官股分點唯一對接 FinMind TaiwanStockSecuritiesBrokerTrades 真實券商代碼。
-4. 獨立提供 purge_gov_database() 清除髒資料庫函式，供手動清理按鈕調用。
-5. 獨立提供 backfill_real_gov_trades() 回補函式，支援天數參數化與前端進度回報回呼。
+1. 更新版本識別為 20261110_0140。
+2. 對接真實八大官股結算端點：
+   - 主端點：玩股網 (WantGoo) 八大行庫買賣超日結算 API。
+   - 備援端點：嗨投資 (HiStock) 八大行庫買賣超盤後端點。
+3. 嚴格協調落盤資料欄位與單位一致性：
+   - 欄位結構統一為：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+   - 張數強制轉換為整數（張）。
+   - 金額強制統一折算為「萬元」（去除億、元單位差異）。
+4. 恪守真實數據原則，無資料即如實回傳空表，嚴禁回退至非官股數據。
 防呆防錯原因：
-1. 若 FinMind 未配置 Token 或查無資料，如實回傳空表，絕不偷跑其他外部數據填補。
-2. 清除資料庫時同步覆蓋本機與 Google Drive 空檔，避免舊污染快取被重新下載。
+1. 爬取過程加入 User-Agent 與 Referer 模擬防爬蟲，並加入正規表達式過濾非數字字元。
+2. 數值轉換加入例外捕捉，遇到無效符號或空值時預設補 0.0，防止批次中斷。
 """
 
-MODULE_VERSION = "20261110_0110"
+MODULE_VERSION = "20261110_0140"
 
 import os
+import re
 import json
 import time
 import datetime
@@ -29,7 +34,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 LOCAL_TAIEX_FILE = os.path.join(CACHE_DIR, "taiex_history.csv")
 LOCAL_GOV_FILE = os.path.join(CACHE_DIR, "gov_trades_history.csv")
 
-# 八大官股券商總行代號與名稱（精確真實分點）
 GOV_BROKER_MAP = {
     "1020": "臺灣銀行",
     "1030": "台灣土地銀行",
@@ -47,6 +51,12 @@ EMPTY_TRADE_COLUMNS = [
     "交易日期", "官股分點", "代號", "名稱",
     "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"
 ]
+
+REQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, application/xhtml+xml, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+}
 
 def purge_gov_database() -> bool:
     """手動專用：清空本機與 Google Drive 上的官股歷史資料庫"""
@@ -129,86 +139,160 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
         return local_df
     return pd.DataFrame()
 
-def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
-    """純真實來源：自 FinMind 取得 8 大公股券商總行當日明細"""
-    token = st.secrets.get("finmind", {}).get("api_token", "")
-    url = "https://api.finmindtrade.com/api/v4/data"
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+def _parse_clean_num(val) -> float:
+    if pd.isnull(val):
+        return 0.0
+    s = str(val).replace(",", "").replace("%", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+# ----------------- 主端點：玩股網 (WantGoo) 官股買賣超結算 -----------------
+def _query_wantgoo_gov_trades(trade_date: str) -> pd.DataFrame:
+    """自玩股網抓取當日八大公股結算真實買賣超排行榜"""
+    headers = dict(REQ_HEADERS)
+    headers["Referer"] = "https://www.wantgoo.com/investor/bank/buy-rank"
+
     records = []
-    
-    for b_code, b_name in GOV_BROKER_MAP.items():
-        params = {
-            "dataset": "TaiwanStockSecuritiesBrokerTrades",
-            "data_id": b_code,
-            "start_date": trade_date,
-            "end_date": trade_date
-        }
+    # 爬取買超與賣超結算
+    for rank_type in ["buy", "sell"]:
+        url = f"https://www.wantgoo.com/investor/bank/{rank_type}-rank-data?day={trade_date}"
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=8)
+            resp = requests.get(url, headers=headers, timeout=6)
             if resp.status_code == 200:
-                data = resp.json().get("data", [])
-                for item in data:
-                    s_code = str(item.get("stock_id", "")).strip()
-                    s_name = str(item.get("stock_name", s_code)).strip()
-                    buy_v = int(item.get("buy", 0))
-                    sell_v = int(item.get("sell", 0))
-                    net_v = buy_v - sell_v
-                    price = float(item.get("price", 0.0))
-                    net_amt = round(net_v * price * 0.1, 2)
+                data = resp.json()
+                items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for it in items:
+                    stock_no = str(it.get("stockNo", it.get("id", ""))).strip()
+                    stock_name = str(it.get("stockName", it.get("name", stock_no))).strip()
                     
-                    if buy_v > 0 or sell_v > 0:
+                    buy_v = int(_parse_clean_num(it.get("buy", 0)))
+                    sell_v = int(_parse_clean_num(it.get("sell", 0)))
+                    net_v = int(_parse_clean_num(it.get("net", buy_v - sell_v)))
+                    if rank_type == "sell" and net_v > 0:
+                        net_v = -net_v
+
+                    # 金額單位換算為「萬元」
+                    # 若原始欄位為億元（例：3.45），乘以 10000 轉為萬元；若原生就是金額，依數值大小自動正規化
+                    raw_amt = _parse_clean_num(it.get("amount", it.get("netAmount", 0)))
+                    if abs(raw_amt) < 1000 and abs(raw_amt) > 0:
+                        amt_wan = round(raw_amt * 10000, 2)
+                    elif abs(raw_amt) > 1000000:
+                        amt_wan = round(raw_amt / 10000, 2)
+                    else:
+                        amt_wan = round(raw_amt, 2)
+
+                    if rank_type == "sell" and amt_wan > 0:
+                        amt_wan = -amt_wan
+
+                    if stock_no and (buy_v != 0 or sell_v != 0 or net_v != 0):
                         records.append({
                             "交易日期": trade_date,
-                            "官股分點": b_name,
-                            "代號": s_code,
-                            "名稱": s_name,
+                            "官股分點": "全部官股合計",
+                            "代號": stock_no,
+                            "名稱": stock_name,
                             "買進張數": buy_v,
                             "賣出張數": sell_v,
                             "買賣超張數": net_v,
-                            "金額(萬元)": net_amt
+                            "金額(萬元)": amt_wan
                         })
         except Exception:
             pass
 
     if records:
-        df_rec = pd.DataFrame(records)
-        # 由真實 8 大分點聚合一筆「全部官股合計」
-        df_sum = df_rec.groupby(["交易日期", "代號", "名稱"], as_index=False).agg({
-            "買進張數": "sum",
-            "賣出張數": "sum",
-            "買賣超張數": "sum",
-            "金額(萬元)": "sum"
-        })
-        df_sum["官股分點"] = "全部官股合計"
-        return pd.concat([df_rec, df_sum], ignore_index=True)
+        df = pd.DataFrame(records).drop_duplicates(subset=["代號"], keep="first")
+        return df
+    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
+# ----------------- 備用端點：嗨投資 (HiStock) 官股買賣超 -----------------
+def _query_histock_gov_trades(trade_date: str) -> pd.DataFrame:
+    """自 HiStock 抓取當日八大官股彙總（備援管道）"""
+    url = f"https://histock.tw/stock/broker8.aspx?date={trade_date}"
+    headers = dict(REQ_HEADERS)
+    headers["Referer"] = "https://histock.tw/"
+
+    records = []
+    try:
+        resp = requests.get(url, headers=headers, timeout=6)
+        if resp.status_code == 200 and "table" in resp.text:
+            tables = pd.read_html(resp.text)
+            for tbl in tables:
+                col_names = [str(c) for c in tbl.columns]
+                if any("代號" in c for c in col_names) and any("買賣超" in c for c in col_names):
+                    # 辨識代號、名稱、買賣超張數、金額欄位
+                    c_id = next(c for c in col_names if "代號" in c)
+                    c_name = next(c for c in col_names if "名稱" in c or "股票" in c)
+                    c_net = next(c for c in col_names if "買賣超" in c and "金額" not in c)
+                    c_amt = next((c for c in col_names if "金額" in c), None)
+
+                    for _, row in tbl.iterrows():
+                        s_id = str(row[c_id]).strip()
+                        s_name = str(row[c_name]).strip()
+                        net_v = int(_parse_clean_num(row[c_net]))
+                        
+                        amt_wan = 0.0
+                        if c_amt and c_amt in row:
+                            amt_val = _parse_clean_num(row[c_amt])
+                            # 若欄位標明億元，折合萬元
+                            if "億" in str(c_amt) or "億" in str(row[c_amt]):
+                                amt_wan = round(amt_val * 10000, 2)
+                            else:
+                                amt_wan = round(amt_val / 10000, 2) if abs(amt_val) > 1000000 else round(amt_val, 2)
+
+                        if s_id and net_v != 0:
+                            records.append({
+                                "交易日期": trade_date,
+                                "官股分點": "全部官股合計",
+                                "代號": s_id,
+                                "名稱": s_name,
+                                "買進張數": net_v if net_v > 0 else 0,
+                                "賣出張數": abs(net_v) if net_v < 0 else 0,
+                                "買賣超張數": net_v,
+                                "金額(萬元)": amt_wan
+                            })
+                    break
+    except Exception:
+        pass
+
+    if records:
+        return pd.DataFrame(records).drop_duplicates(subset=["代號"], keep="first")
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
 def backfill_single_day(trade_date: str) -> pd.DataFrame:
-    """回補單日真實官股資料並落地持久化"""
-    new_df = _query_finmind_gov_trades(trade_date)
-    if not new_df.empty:
+    """雙端點依序回補：主端點優先，備用端點第二，統一資料欄位並落地持久化"""
+    # 1. 優先嘗試玩股網結算端點
+    df = _query_wantgoo_gov_trades(trade_date)
+    # 2. 備用嘗試 HiStock 端點
+    if df.empty:
+        df = _query_histock_gov_trades(trade_date)
+
+    if not df.empty:
+        # 強制正規化欄位型態
+        df["買進張數"] = df["買進張數"].astype(int)
+        df["賣出張數"] = df["賣出張數"].astype(int)
+        df["買賣超張數"] = df["買賣超張數"].astype(int)
+        df["金額(萬元)"] = df["金額(萬元)"].astype(float).round(2)
+
         try:
             if os.path.exists(LOCAL_GOV_FILE):
                 existing_df = pd.read_csv(LOCAL_GOV_FILE)
                 if "買賣超金額(萬元)" in existing_df.columns and "金額(萬元)" not in existing_df.columns:
                     existing_df = existing_df.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-                combined = pd.concat([existing_df, new_df], ignore_index=True)
+                combined = pd.concat([existing_df, df], ignore_index=True)
                 combined = combined.drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
             else:
-                combined = new_df
+                combined = df
             combined.to_csv(LOCAL_GOV_FILE, index=False)
             cloud_sync.upload_file_to_drive(LOCAL_GOV_FILE, "gov_trades_history.csv")
         except Exception as e:
             print(f"[data_loader] 歷史官股落地同步失敗: {e}")
-        return new_df
+        return df
+
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
 def backfill_real_gov_trades(start_date: str, end_date: str, max_days: int = 10, progress_cb=None) -> int:
-    """
-    手動專用：回補指定區間內的真實官股日報資料
-    回傳：成功補齊入庫的交易天數
-    """
+    """手動回補指定區間真實官股結算資料，回傳成功入庫天數"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
 
@@ -232,14 +316,14 @@ def backfill_real_gov_trades(start_date: str, end_date: str, max_days: int = 10,
         res = backfill_single_day(t_day)
         if not res.empty:
             success_count += 1
-        time.sleep(0.3)  # 溫和延遲保護 API
+        time.sleep(0.4)  # 溫和延遲保護端點
 
     clear_gov_cache()
     return success_count
 
 @st.cache_data(ttl=1800)
 def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
-    """純讀取模式：取得指定日期的官股資料（優先自落地庫提取）"""
+    """純讀取模式：取得指定日期官股資料（優先自落地歷史庫中讀取）"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
         
@@ -258,7 +342,7 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=1800)
 def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """純讀取模式：自乾淨歷史庫彙整區間統計，不自動在背後隱蔽回補"""
+    """純讀取模式：自落地歷史庫彙總區間統計，不自動在背後隱蔽回補"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
 

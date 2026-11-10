@@ -1,16 +1,18 @@
 """
 模組名稱：data_loader.py
-版本識別：20261110_0015
+版本識別：20261110_0110
 修改目的：
-1. 更新版本識別為 20261110_0015。
-2. fetch_range_gov_branch_summary 支援 max_fill_days 參數化（不再寫死 5 天），並提供 progress_callback 供前端即時回報進度。
-3. 提供 clear_gov_cache() 函式，供前端「強制回補」按鈕調用以清空快取。
-4. 欄位維持：['交易日期', '官股分點', '代號', '名稱', '買進張數', '賣出張數', '買賣超張數', '金額(萬元)']。
+1. 更新版本識別為 20261110_0110。
+2. 徹底拔除證交所三大法人 T86 請求代碼與假官股降級邏輯，嚴禁使用非官股數據充數。
+3. 八大官股分點唯一對接 FinMind TaiwanStockSecuritiesBrokerTrades 真實券商代碼。
+4. 獨立提供 purge_gov_database() 清除髒資料庫函式，供手動清理按鈕調用。
+5. 獨立提供 backfill_real_gov_trades() 回補函式，支援天數參數化與前端進度回報回呼。
 防呆防錯原因：
-1. 回補過程遇休市或無數據日期平滑略過，避免例外中斷整個批次。
+1. 若 FinMind 未配置 Token 或查無資料，如實回傳空表，絕不偷跑其他外部數據填補。
+2. 清除資料庫時同步覆蓋本機與 Google Drive 空檔，避免舊污染快取被重新下載。
 """
 
-MODULE_VERSION = "20261110_0015"
+MODULE_VERSION = "20261110_0110"
 
 import os
 import json
@@ -27,6 +29,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 LOCAL_TAIEX_FILE = os.path.join(CACHE_DIR, "taiex_history.csv")
 LOCAL_GOV_FILE = os.path.join(CACHE_DIR, "gov_trades_history.csv")
 
+# 八大官股券商總行代號與名稱（精確真實分點）
 GOV_BROKER_MAP = {
     "1020": "臺灣銀行",
     "1030": "台灣土地銀行",
@@ -45,8 +48,20 @@ EMPTY_TRADE_COLUMNS = [
     "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"
 ]
 
+def purge_gov_database() -> bool:
+    """手動專用：清空本機與 Google Drive 上的官股歷史資料庫"""
+    try:
+        empty_df = pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+        empty_df.to_csv(LOCAL_GOV_FILE, index=False)
+        cloud_sync.upload_file_to_drive(LOCAL_GOV_FILE, "gov_trades_history.csv")
+        clear_gov_cache()
+        return True
+    except Exception as e:
+        print(f"[data_loader] 清空歷史資料庫失敗: {e}")
+        return False
+
 def clear_gov_cache():
-    """清除官股統計相關的記憶體快取"""
+    """清除 Streamlit 記憶體快取"""
     fetch_range_gov_branch_summary.clear()
     fetch_gov_branch_trades.clear()
 
@@ -114,17 +129,8 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
         return local_df
     return pd.DataFrame()
 
-def _clean_num(val) -> float:
-    if pd.isnull(val):
-        return 0.0
-    s = str(val).replace(",", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
 def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
-    """透過 FinMind API 取得八大官股分點在特定日期的進出明細"""
+    """純真實來源：自 FinMind 取得 8 大公股券商總行當日明細"""
     token = st.secrets.get("finmind", {}).get("api_token", "")
     url = "https://api.finmindtrade.com/api/v4/data"
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -138,7 +144,7 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
             "end_date": trade_date
         }
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=6)
+            resp = requests.get(url, params=params, headers=headers, timeout=8)
             if resp.status_code == 200:
                 data = resp.json().get("data", [])
                 for item in data:
@@ -150,21 +156,23 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
                     price = float(item.get("price", 0.0))
                     net_amt = round(net_v * price * 0.1, 2)
                     
-                    records.append({
-                        "交易日期": trade_date,
-                        "官股分點": b_name,
-                        "代號": s_code,
-                        "名稱": s_name,
-                        "買進張數": buy_v,
-                        "賣出張數": sell_v,
-                        "買賣超張數": net_v,
-                        "金額(萬元)": net_amt
-                    })
+                    if buy_v > 0 or sell_v > 0:
+                        records.append({
+                            "交易日期": trade_date,
+                            "官股分點": b_name,
+                            "代號": s_code,
+                            "名稱": s_name,
+                            "買進張數": buy_v,
+                            "賣出張數": sell_v,
+                            "買賣超張數": net_v,
+                            "金額(萬元)": net_amt
+                        })
         except Exception:
             pass
 
     if records:
         df_rec = pd.DataFrame(records)
+        # 由真實 8 大分點聚合一筆「全部官股合計」
         df_sum = df_rec.groupby(["交易日期", "代號", "名稱"], as_index=False).agg({
             "買進張數": "sum",
             "賣出張數": "sum",
@@ -176,69 +184,9 @@ def _query_finmind_gov_trades(trade_date: str) -> pd.DataFrame:
 
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
-def _query_twse_gov_ranking(trade_date: str) -> pd.DataFrame:
-    """向證交所官方盤後端點請求真實歷史交易統計（備援回退機制）"""
-    date_compact = trade_date.replace("-", "")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01"
-    }
-    twse_url = f"https://www.twse.com.tw/rwd/zh/fund/T86?date={date_compact}&selectType=ALLBUT0999&response=json"
-    records = []
-    
-    try:
-        resp = requests.get(twse_url, headers=headers, timeout=8)
-        if resp.status_code == 200:
-            json_data = resp.json()
-            if json_data.get("stat") == "OK" and "data" in json_data:
-                raw_rows = json_data["data"]
-                for row in raw_rows:
-                    if len(row) >= 19:
-                        stock_code = str(row[0]).strip()
-                        stock_name = str(row[1]).strip()
-                        buy_vol = int(_clean_num(row[2]) / 1000)
-                        sell_vol = int(_clean_num(row[3]) / 1000)
-                        net_vol = int(_clean_num(row[4]) / 1000)
-                        net_amt = round(_clean_num(row[4]) * 0.01, 2)
-                        
-                        records.append({
-                            "交易日期": trade_date,
-                            "官股分點": "全部官股合計",
-                            "代號": stock_code,
-                            "名稱": stock_name,
-                            "買進張數": buy_vol,
-                            "賣出張數": sell_vol,
-                            "買賣超張數": net_vol,
-                            "金額(萬元)": net_amt
-                        })
-    except Exception as e:
-        print(f"[data_loader] 證交所官方端點請求失敗: {e}")
-
-    if records:
-        return pd.DataFrame(records)
-    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
-
-@st.cache_data(ttl=1800)
-def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
-    """取得真實分點交易資料，具備本機快取與雲端同步機制"""
-    if not os.path.exists(LOCAL_GOV_FILE):
-        cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
-        
-    if os.path.exists(LOCAL_GOV_FILE):
-        try:
-            cached_db = pd.read_csv(LOCAL_GOV_FILE)
-            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
-                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-            match_rows = cached_db[cached_db["交易日期"] == trade_date]
-            if not match_rows.empty:
-                return match_rows
-        except Exception:
-            pass
-
+def backfill_single_day(trade_date: str) -> pd.DataFrame:
+    """回補單日真實官股資料並落地持久化"""
     new_df = _query_finmind_gov_trades(trade_date)
-    if new_df.empty:
-        new_df = _query_twse_gov_ranking(trade_date)
-
     if not new_df.empty:
         try:
             if os.path.exists(LOCAL_GOV_FILE):
@@ -254,12 +202,13 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
         except Exception as e:
             print(f"[data_loader] 歷史官股落地同步失敗: {e}")
         return new_df
-
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
-@st.cache_data(ttl=1800)
-def fetch_range_gov_branch_summary(start_date: str, end_date: str, max_fill_days: int = 10) -> pd.DataFrame:
-    """區間統計函式：自歷史庫彙總，缺失日期支援參數化回補上限並同步 Google Drive"""
+def backfill_real_gov_trades(start_date: str, end_date: str, max_days: int = 10, progress_cb=None) -> int:
+    """
+    手動專用：回補指定區間內的真實官股日報資料
+    回傳：成功補齊入庫的交易天數
+    """
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
 
@@ -267,32 +216,61 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str, max_fill_days
     if os.path.exists(LOCAL_GOV_FILE):
         try:
             cached_db = pd.read_csv(LOCAL_GOV_FILE)
-            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
-                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
         except Exception:
             cached_db = pd.DataFrame()
 
     work_days = pd.date_range(start_date, end_date, freq="B").strftime("%Y-%m-%d").tolist()
     recorded_days = set(cached_db["交易日期"].unique()) if not cached_db.empty and "交易日期" in cached_db.columns else set()
-    
     missing_days = [d for d in work_days if d not in recorded_days]
 
-    if missing_days and max_fill_days > 0:
-        fill_targets = missing_days[-max_fill_days:]
-        for m_day in fill_targets:
-            fetch_gov_branch_trades(m_day)
-            time.sleep(0.15)
+    targets = missing_days[-max_days:] if max_days > 0 else missing_days
+    success_count = 0
 
-        if os.path.exists(LOCAL_GOV_FILE):
-            try:
-                cached_db = pd.read_csv(LOCAL_GOV_FILE)
-                if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
-                    cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-            except Exception:
-                pass
+    for idx, t_day in enumerate(targets):
+        if progress_cb:
+            progress_cb((idx + 1) / len(targets), t_day)
+        res = backfill_single_day(t_day)
+        if not res.empty:
+            success_count += 1
+        time.sleep(0.3)  # 溫和延遲保護 API
 
-    if not cached_db.empty and "交易日期" in cached_db.columns:
-        mask = (cached_db["交易日期"] >= start_date) & (cached_db["交易日期"] <= end_date)
-        return cached_db[mask]
+    clear_gov_cache()
+    return success_count
+
+@st.cache_data(ttl=1800)
+def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
+    """純讀取模式：取得指定日期的官股資料（優先自落地庫提取）"""
+    if not os.path.exists(LOCAL_GOV_FILE):
+        cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
+        
+    if os.path.exists(LOCAL_GOV_FILE):
+        try:
+            cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
+                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
+            match_rows = cached_db[cached_db["交易日期"] == trade_date]
+            if not match_rows.empty:
+                return match_rows
+        except Exception:
+            pass
+
+    return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+
+@st.cache_data(ttl=1800)
+def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
+    """純讀取模式：自乾淨歷史庫彙整區間統計，不自動在背後隱蔽回補"""
+    if not os.path.exists(LOCAL_GOV_FILE):
+        cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
+
+    if os.path.exists(LOCAL_GOV_FILE):
+        try:
+            cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
+                cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
+            if not cached_db.empty and "交易日期" in cached_db.columns:
+                mask = (cached_db["交易日期"] >= start_date) & (cached_db["交易日期"] <= end_date)
+                return cached_db[mask]
+        except Exception:
+            pass
 
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)

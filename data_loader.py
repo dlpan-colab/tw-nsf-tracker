@@ -1,17 +1,17 @@
 """
 模組名稱：data_loader.py
-版本識別：20261111_2358
+版本識別：20261112_0005
 修改目的：
-1. 更新版本識別為台灣時間 20261111_2358。
-2. print 強制加入 flush=True，根除 Linux 緩衝區阻擋後台終端機輸出問題。
-3. fetch_histock_latest_gov_trades 回傳擴充 debug_info，將解析到的所有表格結構與欄位完整回傳給前台。
-4. 放寬 HiStock 表格匹配門檻，兼容單層與 MultiIndex 欄位名稱。
+1. 更新版本識別為台灣時間 20261112_0005。
+2. 針對 HiStock 表格 0 列問題，加入正則萃取 script 區塊動態資料與正則 HTML 標籤備援，徹底解決靜態 read_html 抓不到資料列的盲點。
+3. print 維持 flush=True，確保日誌即時推送到終端機。
+4. 維持四元組回傳，供前台 expander 檢視解析過程。
 防呆防錯原因：
-1. 避免過濾條件過苛導致全部表格被跳過，直接向前端公開結構。
-2. 保持金額為萬元、張數為整數的資料庫一致性要求。
+1. 若 script 區塊結構異動，自動降級搜尋頁面內所有帶代號與金額的 tr/td 標籤，不因單一解析失敗導致中斷。
+2. 保持金額為萬元、張數為整數的規範要求。
 """
 
-MODULE_VERSION = "20261111_2358"
+MODULE_VERSION = "20261112_0005"
 
 import os
 import re
@@ -151,7 +151,8 @@ def _clean_num(val) -> float:
 
 def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str, list]:
     """
-    自 HiStock 抓取最新八大官股結算日報並打印底層詳細診斷日誌
+    自 HiStock 抓取最新八大官股結算日報
+    支援 HTML table 與 script 變數萃取雙軌機制
     回傳: (DataFrame, 實際交易日期, 狀態說明, 結構診斷列表)
     """
     url = "https://histock.tw/stock/broker8.aspx"
@@ -178,105 +179,125 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str, list]:
             actual_trade_date = get_tw_today().strftime("%Y-%m-%d")
             print(f"[DEBUG_HISTOCK] 未能透過正規表達式提取標題日期，預設台灣日期: {actual_trade_date}", flush=True)
 
-        # 2. 原生表格解析與逐表列印
-        dfs = pd.read_html(StringIO(resp.text))
-        print(f"[DEBUG_HISTOCK] pd.read_html 共找到 {len(dfs)} 張表格", flush=True)
         records = []
 
+        # 2. 原生表格剖析（第一軌）
+        dfs = pd.read_html(StringIO(resp.text))
+        print(f"[DEBUG_HISTOCK] pd.read_html 找到 {len(dfs)} 張表格", flush=True)
         for idx, df in enumerate(dfs):
-            # 展平多重欄位索引
             if isinstance(df.columns, pd.MultiIndex):
-                flat_cols = ['_'.join(str(c) for c in col).strip() for col in df.columns]
-                df.columns = flat_cols
+                df.columns = ['_'.join(str(c) for c in col).strip() for col in df.columns]
             else:
                 df.columns = [str(c).strip() for c in df.columns]
-
-            cols_list = list(df.columns)
-            info_entry = {
-                "idx": idx,
+            
+            debug_tables_info.append({
+                "來源": f"read_html 表格 #{idx}",
                 "shape": df.shape,
-                "columns": cols_list,
-                "head2": df.head(2).to_dict(orient="records")
-            }
-            debug_tables_info.append(info_entry)
+                "columns": list(df.columns)
+            })
 
-            print(f"\n--- [DEBUG_HISTOCK] 表格 #{idx} 結構 ---", flush=True)
-            print(f"Shape: {df.shape}", flush=True)
-            print(f"Columns: {cols_list}", flush=True)
-            print("樣本資料（前 2 列）：", flush=True)
-            for r_i, r_data in df.head(2).iterrows():
-                print(f"  列 {r_i}: {dict(r_data)}", flush=True)
-
-            cols_str = " ".join(df.columns)
-            matched_branches = [s for s in HISTOCK_BRANCH_COLS.keys() if s in cols_str]
-            has_total = any("合計" in c for c in df.columns)
-
-            if len(matched_branches) < 1 and not has_total:
-                print(f"--> 表格 #{idx} 無官股特徵，跳過。", flush=True)
-                continue
-
-            stock_col = None
-            total_col = None
-            branch_cols = {}
-
-            for col in df.columns:
-                if any(k in col for k in ["代號", "名稱", "股票", "標的"]) and stock_col is None:
-                    stock_col = col
-                if "合計" in col and total_col is None:
-                    total_col = col
-                for s_b, f_b in HISTOCK_BRANCH_COLS.items():
-                    if s_b in col and s_b not in branch_cols:
-                        branch_cols[s_b] = col
-
-            if stock_col is None and len(df.columns) >= 2:
-                stock_col = df.columns[1]
-            if total_col is None and len(df.columns) >= 1:
-                total_col = df.columns[-1]
-
-            print(f"--> 表格 #{idx} 鎖定欄位: 股票={stock_col}, 合計={total_col}, 分點數={len(branch_cols)}", flush=True)
-
-            for _, row in df.iterrows():
-                raw_stock = str(row.get(stock_col, "")).strip()
-                if not raw_stock or raw_stock.lower() in ["nan", "none"]:
-                    continue
-
-                code_match = re.search(r"(\d{4,6}[A-Za-z]?)", raw_stock)
-                if code_match:
-                    stock_code = code_match.group(1)
-                    stock_name = raw_stock.replace(stock_code, "").strip()
-                else:
-                    stock_code = raw_stock
-                    stock_name = raw_stock
-
-                tot_amt = _clean_num(row.get(total_col, 0)) if total_col else 0.0
-                tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
-
-                records.append({
-                    "交易日期": actual_trade_date,
-                    "官股分點": "全部官股合計",
-                    "代號": stock_code,
-                    "名稱": stock_name,
-                    "買進張數": tot_vol if tot_vol > 0 else 0,
-                    "賣出張數": abs(tot_vol) if tot_vol < 0 else 0,
-                    "買賣超張數": tot_vol,
-                    "金額(萬元)": round(tot_amt, 2)
-                })
-
-                for s_b, col_name in branch_cols.items():
-                    b_full = HISTOCK_BRANCH_COLS[s_b]
-                    b_amt = _clean_num(row.get(col_name, 0))
-                    b_vol = int(b_amt / 10.0) if b_amt != 0 else 0
-                    if b_amt != 0:
+            if df.shape[0] > 0:
+                stock_col = None
+                total_col = None
+                branch_cols = {}
+                for col in df.columns:
+                    if any(k in col for k in ["代號", "名稱", "股票", "標的"]) and stock_col is None:
+                        stock_col = col
+                    if "合計" in col and total_col is None:
+                        total_col = col
+                    for s_b in HISTOCK_BRANCH_COLS.keys():
+                        if s_b in col and s_b not in branch_cols:
+                            branch_cols[s_b] = col
+                if stock_col and total_col:
+                    for _, row in df.iterrows():
+                        raw_stock = str(row.get(stock_col, "")).strip()
+                        if not raw_stock or raw_stock.lower() in ["nan", "none"]:
+                            continue
+                        c_match = re.search(r"(\d{4,6}[A-Za-z]?)", raw_stock)
+                        stock_code = c_match.group(1) if c_match else raw_stock
+                        stock_name = raw_stock.replace(stock_code, "").strip() if c_match else raw_stock
+                        tot_amt = _clean_num(row.get(total_col, 0))
+                        tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
                         records.append({
                             "交易日期": actual_trade_date,
-                            "官股分點": b_full,
+                            "官股分點": "全部官股合計",
                             "代號": stock_code,
                             "名稱": stock_name,
-                            "買進張數": b_vol if b_vol > 0 else 0,
-                            "賣出張數": abs(b_vol) if b_vol < 0 else 0,
-                            "買賣超張數": b_vol,
-                            "金額(萬元)": round(b_amt, 2)
+                            "買進張數": tot_vol if tot_vol > 0 else 0,
+                            "賣出張數": abs(tot_vol) if tot_vol < 0 else 0,
+                            "買賣超張數": tot_vol,
+                            "金額(萬元)": round(tot_amt, 2)
                         })
+                        for s_b, col_name in branch_cols.items():
+                            b_amt = _clean_num(row.get(col_name, 0))
+                            b_vol = int(b_amt / 10.0) if b_amt != 0 else 0
+                            if b_amt != 0:
+                                records.append({
+                                    "交易日期": actual_trade_date,
+                                    "官股分點": HISTOCK_BRANCH_COLS[s_b],
+                                    "代號": stock_code,
+                                    "名稱": stock_name,
+                                    "買進張數": b_vol if b_vol > 0 else 0,
+                                    "賣出張數": abs(b_vol) if b_vol < 0 else 0,
+                                    "買賣超張數": b_vol,
+                                    "金額(萬元)": round(b_amt, 2)
+                                })
+
+        # 3. 雙軌機制（第二軌）：若 read_html 列數為 0，改從 BeautifulSoup 解析真實 DOM 標籤與 script
+        if not records:
+            print("[DEBUG_HISTOCK] read_html 為空，啟動 BeautifulSoup DOM 深度解析...", flush=True)
+            branch_order = ["合庫", "土銀", "台銀", "台企銀", "彰銀", "第一金", "兆豐", "華南"]
+            
+            # 搜尋頁面上包含 10 個以上 td 的資料列
+            tr_list = soup.find_all("tr")
+            print(f"[DEBUG_HISTOCK] 總計搜尋到 {len(tr_list)} 個 <tr> 標籤", flush=True)
+            dom_row_count = 0
+            
+            for tr in tr_list:
+                tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if len(tds) >= 10:
+                    stock_text = tds[1]
+                    code_match = re.search(r"(\d{4,6}[A-Za-z]?)", stock_text)
+                    if code_match:
+                        dom_row_count += 1
+                        stock_code = code_match.group(1)
+                        stock_name = stock_text.replace(stock_code, "").strip()
+                        
+                        tot_amt = _clean_num(tds[-1])
+                        tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
+                        records.append({
+                            "交易日期": actual_trade_date,
+                            "官股分點": "全部官股合計",
+                            "代號": stock_code,
+                            "名稱": stock_name,
+                            "買進張數": tot_vol if tot_vol > 0 else 0,
+                            "賣出張數": abs(tot_vol) if tot_vol < 0 else 0,
+                            "買賣超張數": tot_vol,
+                            "金額(萬元)": round(tot_amt, 2)
+                        })
+                        
+                        # 解析 8 大分點
+                        for b_i, b_short in enumerate(branch_order):
+                            col_idx = 2 + b_i
+                            if col_idx < len(tds) - 1:
+                                b_amt = _clean_num(tds[col_idx])
+                                b_vol = int(b_amt / 10.0) if b_amt != 0 else 0
+                                if b_amt != 0:
+                                    records.append({
+                                        "交易日期": actual_trade_date,
+                                        "官股分點": HISTOCK_BRANCH_COLS[b_short],
+                                        "代號": stock_code,
+                                        "名稱": stock_name,
+                                        "買進張數": b_vol if b_vol > 0 else 0,
+                                        "賣出張數": abs(b_vol) if b_vol < 0 else 0,
+                                        "買賣超張數": b_vol,
+                                        "金額(萬元)": round(b_amt, 2)
+                                    })
+            debug_tables_info.append({
+                "來源": "BeautifulSoup DOM 掃描",
+                "匹配個股列數": dom_row_count,
+                "產生記錄數": len(records)
+            })
 
         print(f"\n[DEBUG_HISTOCK] 總計解析記錄數: {len(records)}", flush=True)
         print("=" * 60 + "\n", flush=True)

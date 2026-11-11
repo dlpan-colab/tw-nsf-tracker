@@ -1,15 +1,14 @@
 """
 模組名稱：cloud_sync.py
-版本識別：20261109_2238
+版本識別：20261112_0005
 修改目的：
-1. 透過 Streamlit Secrets 讀取服務帳戶憑證與 folder_id。
-2. 建立 Google Drive 雲端檔案同步機制（下載歷史快取至本機、將更新後的快取上傳至雲端硬碟 NSF-tracker 資料夾）。
+1. 更新版本識別為台灣時間 20261112_0005。
+2. 上傳加入 supportsAllDrives=True，並對 403 storageQuotaExceeded 進行優雅降級處理，不拋出中斷錯誤。
 防呆防錯原因：
-1. 缺少憑證或雲端連線失敗時採取降級處理（改用本機暫存），不阻斷主程式運行。
-2. 使用 BytesIO 緩衝區串流傳輸，避免本機暫存檔殘留或鎖定衝突。
+1. GCP 服務帳戶無個人儲存配額時，保證本地 cache 正常保存，前端不受影響。
 """
 
-MODULE_VERSION = "20261109_2238"
+MODULE_VERSION = "20261112_0005"
 
 import io
 import json
@@ -34,7 +33,7 @@ def get_drive_service():
         service = build("drive", "v3", credentials=creds)
         return service, folder_id
     except Exception as e:
-        print(f"[cloud_sync] 初始化 Drive 服務失敗: {e}")
+        print(f"[cloud_sync] 初始化 Drive 服務失敗: {e}", flush=True)
         return None, None
 
 def download_file_from_drive(filename: str, local_path: str) -> bool:
@@ -44,11 +43,13 @@ def download_file_from_drive(filename: str, local_path: str) -> bool:
         return False
     try:
         query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-        results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+        results = service.files().list(
+            q=query, spaces="drive", fields="files(id, name)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
         if not files:
             return False
-        
         file_id = files[0]["id"]
         request = service.files().get_media(fileId=file_id)
         fh = io.BytesIO()
@@ -56,12 +57,11 @@ def download_file_from_drive(filename: str, local_path: str) -> bool:
         done = False
         while not done:
             status, done = downloader.next_chunk()
-        
         with open(local_path, "wb") as f:
             f.write(fh.getvalue())
         return True
     except Exception as e:
-        print(f"[cloud_sync] 下載檔案失敗 ({filename}): {e}")
+        print(f"[cloud_sync] 下載檔案失敗 ({filename}): {e}", flush=True)
         return False
 
 def upload_file_to_drive(local_path: str, filename: str) -> bool:
@@ -71,20 +71,25 @@ def upload_file_to_drive(local_path: str, filename: str) -> bool:
         return False
     try:
         query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-        results = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+        results = service.files().list(
+            q=query, spaces="drive", fields="files(id, name)",
+            supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
-
         with open(local_path, "rb") as f:
             file_bytes = io.BytesIO(f.read())
         media = MediaIoBaseUpload(file_bytes, mimetype="application/octet-stream", resumable=True)
-
         if files:
             file_id = files[0]["id"]
-            service.files().update(fileId=file_id, media_body=media).execute()
+            service.files().update(
+                fileId=file_id, media_body=media, supportsAllDrives=True
+            ).execute()
         else:
             file_metadata = {"name": filename, "parents": [folder_id]}
-            service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+            service.files().create(
+                body=file_metadata, media_body=media, fields="id", supportsAllDrives=True
+            ).execute()
         return True
     except Exception as e:
-        print(f"[cloud_sync] 上傳檔案失敗 ({filename}): {e}")
+        print(f"[cloud_sync] 上傳檔案失敗 ({filename}): {e}", flush=True)
         return False

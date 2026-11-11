@@ -1,15 +1,15 @@
 """
 模組名稱：app.py
-版本識別：20261111_2358
+版本識別：20261112_0007
 修改目的：
-1. 更新版本識別為台灣時間 20261111_2358，與 data_loader.py 嚴格對齊。
-2. 側邊欄抓取按鈕接收四元組回傳，並將表格診斷資訊（debug_tables_info）直接透過 st.expander 呈現於前台。
+1. 更新版本識別為台灣時間 20261112_0007。
+2. 診斷展開區全面改用防呆取值（.get()），徹底排除 KeyError: 'idx' 崩潰。
 3. 終端機 print 加入 flush=True，確保後台日誌不再被緩衝區吞沒。
 防呆防錯原因：
-1. 完全公開 HTML 解析中間過程，使用者在前台即可直接檢視 HiStock 解析出的表格結構與欄位名稱。
+1. 避免 data_loader.py 回傳不同字典結構時造成取值中斷，保證前台穩定運行。
 """
 
-MODULE_VERSION = "20261111_2358"
+MODULE_VERSION = "20261112_0007"
 
 import streamlit as st
 import datetime
@@ -124,11 +124,17 @@ if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_containe
 if "histock_debug_info" in st.session_state and st.session_state["histock_debug_info"]:
     with st.sidebar.expander("🔍 查看 HiStock 表格結構診斷"):
         st.write(f"狀態：{st.session_state.get('histock_status_msg', '')}")
-        for t in st.session_state["histock_debug_info"]:
-            st.markdown(f"**表格 #{t['idx']} (形狀: {t['shape']})**")
-            st.code(str(t['columns']), language="python")
-            if t['head2']:
-                st.json(t['head2'])
+        for idx, t in enumerate(st.session_state["histock_debug_info"]):
+            src_label = t.get("來源", f"表格 #{t.get('idx', idx)}")
+            shape_info = f" (形狀: {t['shape']})" if "shape" in t else ""
+            st.markdown(f"**{src_label}{shape_info}**")
+            if "columns" in t:
+                st.code(str(t["columns"]), language="python")
+            if t.get("head2"):
+                st.json(t["head2"])
+            other_info = {k: v for k, v in t.items() if k not in ["來源", "idx", "shape", "columns", "head2"]}
+            if other_info:
+                st.json(other_info)
 
 if st.sidebar.button("🗑️ 清除歷史資料庫", use_container_width=True):
     print("\n[APP] 使用者觸發【清除歷史資料庫】...", flush=True)

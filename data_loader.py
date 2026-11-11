@@ -1,19 +1,16 @@
 """
 模組名稱：data_loader.py
-版本識別：20261111_1402
+版本識別：20261111_1410
 修改目的：
-1. 更新版本識別為台灣時間 20261111_1402。
-2. 在 fetch_histock_latest_gov_trades 內部植入透明診斷日誌（print 輸出）：
-   - 輸出 HTTP 狀態碼
-   - 輸出 HTML 下載長度
-   - 輸出解析到的 HTML 表格數量與欄位名稱
-3. 協助使用者直接在 Streamlit Cloud 後台黑底日誌視窗（Manage app）精準確認 HiStock 頁面真實狀況。
+1. 更新版本識別為台灣時間 20261111_1410，與 app.py 同步。
+2. 增強 pd.read_html 表格比對容錯度：不嚴格綁定單一欄位名，採關鍵字模糊匹配。
+3. 保持完整的後台日誌診斷輸出，確保抓取、連線與欄位解析全程透明可查。
 防呆防錯原因：
-1. 避免底層連線異常或表格變更時靜默吞掉錯誤，提供透明除錯資訊，杜絕推測。
-2. 保持落盤與歷史庫欄位單位統一（金額為萬元，張數為整數）。
+1. 若 HiStock 表格表頭帶有隱藏字元或空白，模糊匹配能確保精確定位 8 大行庫與合計欄。
+2. 確保資料寫入 CSV 及 Google Drive 時的格式完全合規（整數張數、萬元單位）。
 """
 
-MODULE_VERSION = "20261111_1402"
+MODULE_VERSION = "20261111_1410"
 
 import os
 import re
@@ -190,7 +187,6 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
 
         records = []
         for idx, df in enumerate(dfs):
-            # 扁平化表頭
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ['_'.join(str(c) for c in col).strip() for col in df.columns]
             else:

@@ -1,23 +1,25 @@
 """
 模組名稱：data_loader.py
-版本識別：20261110_1010
+版本識別：20261111_1355
 修改目的：
-1. 更新版本識別為台灣時間 20261110_1010。
-2. 全面導入 zoneinfo (Asia/Taipei)，所有日期獲取強制綁定台灣標準時區，杜絕 UTC 時差。
-3. 修訂 HiStock 解析器：自動從網頁標題或內容定位真實交易日期，精準抓取買超與賣超 Top 30 及 8 大分點。
-4. 回補日誌透明化：backfill 過程傳遞詳細狀態（HTTP 狀態碼、成功筆數），拒絕黑盒子靜默。
+1. 更新版本識別為台灣時間 20261111_1355。
+2. 廢除脆弱的 BeautifulSoup 節點比對，改採 pd.read_html 原生解析 HiStock 八大官股買賣超表格。
+3. 支援代號與名稱自黏合文字（如 2330台積電）精準正則萃取。
+4. 完整抓取 8 大分點（合庫、土銀、台銀、台企銀、第一金、兆豐、華南、彰銀）及全部官股合計。
+5. 金額統一為「萬元」，張數為整數。
 防呆防錯原因：
-1. HiStock 網址不支援 ?date= 參數時，自動校驗頁面真實日期，避免將當日資料誤標為其他日期。
-2. 數值解析加入健全的正則過濾，確保空值與特殊字符不影響批次執行。
+1. 頁面若因廣告、iframe 或標籤改動，pd.read_html 能直接還原表格陣列，避免 DOM 結構變更引發未抓到數據錯誤。
+2. 遇到空表、非交易日或無數值情況，如實回傳空結構並記錄原因，絕不使用假資料替代。
 """
 
-MODULE_VERSION = "20261110_1010"
+MODULE_VERSION = "20261111_1355"
 
 import os
 import re
 import json
 import time
 import datetime
+from io import StringIO
 from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
@@ -143,10 +145,10 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
         return local_df
     return pd.DataFrame()
 
-def _clean_num(val_str: str) -> float:
-    if not val_str:
+def _clean_num(val) -> float:
+    if val is None or pd.isna(val):
         return 0.0
-    clean = re.sub(r"[^\d\.\-\+]", "", str(val_str).replace(",", ""))
+    clean = re.sub(r"[^\d\.\-\+]", "", str(val).replace(",", ""))
     try:
         return float(clean) if clean else 0.0
     except Exception:
@@ -154,18 +156,17 @@ def _clean_num(val_str: str) -> float:
 
 def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
     """
-    自 HiStock 抓取最新八大官股結算日報
-    回傳: (DataFrame, 抓取到的實際交易日期字串, 狀態日誌說明)
+    自 HiStock 抓取最新八大官股結算日報 (透過 pd.read_html 穩定解析)
+    回傳: (DataFrame, 實際交易日期, 狀態說明)
     """
     url = "https://histock.tw/stock/broker8.aspx"
     try:
-        resp = requests.get(url, headers=REQ_HEADERS, timeout=10)
-        if resp.status_code != 200:
+        resp = requests.get(url, headers=REQ_HEADERS, timeout=12)
+        if resp.status_code != 200 or not resp.text:
             return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"連線異常 HTTP {resp.status_code}"
 
+        # 1. 解析實際發布日期
         soup = BeautifulSoup(resp.text, "html.parser")
-        
-        # 1. 萃取頁面上的真實發布日期（例如 "11-09 Top 30 八大官股銀行合計買超排名"）
         page_text = soup.get_text()
         date_match = re.search(r"(\d{2})[-/](\d{2})\s+Top\s+30\s+八大", page_text)
         current_year = get_tw_today().year
@@ -176,69 +177,61 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
         else:
             actual_trade_date = get_tw_today().strftime("%Y-%m-%d")
 
-        tables = soup.find_all("table")
-        if not tables:
-            return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未找到資料表格"
+        # 2. 原生解析 HTML 表格
+        dfs = pd.read_html(StringIO(resp.text))
+        if not dfs:
+            return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未解析到任何 HTML 表格"
 
         records = []
-        for tbl in tables:
-            rows = tbl.find_all("tr")
-            if not rows or len(rows) < 2:
+        for df in dfs:
+            # 扁平化多重表頭
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ['_'.join(str(c) for c in col).strip() for col in df.columns]
+            else:
+                df.columns = [str(c).strip() for c in df.columns]
+
+            cols_str = " ".join(df.columns)
+            # 確認是否為官股明細表（至少包含兩個行庫簡稱與合計）
+            matched_branches = {short: full for short, full in HISTOCK_BRANCH_COLS.items() if short in cols_str}
+            if len(matched_branches) < 2 or not any("合計" in c for c in df.columns):
                 continue
 
-            header_cells = [th.get_text(strip=True) for th in rows[0].find_all(["th", "td"])]
-            branch_col_indices = {}
-            total_idx = None
-            stock_col_idx = None
+            # 定位股票代號欄位與合計欄位
+            stock_col = None
+            total_col = None
+            branch_cols = {}
 
-            for idx, h_text in enumerate(header_cells):
-                for short_b, full_b in HISTOCK_BRANCH_COLS.items():
-                    if short_b in h_text:
-                        branch_col_indices[idx] = full_b
-                if "合計" in h_text:
-                    total_idx = idx
-                if any(k in h_text for k in ["代號", "名稱", "股票", "標的"]):
-                    stock_col_idx = idx
+            for col in df.columns:
+                if any(k in col for k in ["代號", "名稱", "股票", "標的"]) and stock_col is None:
+                    stock_col = col
+                if "合計" in col and total_col is None:
+                    total_col = col
+                for s_b, f_b in HISTOCK_BRANCH_COLS.items():
+                    if s_b in col and s_b not in branch_cols:
+                        branch_cols[s_b] = col
 
-            if not branch_col_indices and len(header_cells) >= 10:
-                expected_shorts = ["合庫", "土銀", "台銀", "台企銀", "第一金", "兆豐", "華南", "彰銀"]
-                stock_col_idx = 0
-                for i, s_name in enumerate(expected_shorts):
-                    branch_col_indices[i + 1] = HISTOCK_BRANCH_COLS[s_name]
-                total_idx = 9
+            if stock_col is None and len(df.columns) >= 2:
+                stock_col = df.columns[1]  # 通常第 0 欄是排行，第 1 欄是股票
+            if total_col is None:
+                total_col = df.columns[-1]
 
-            if stock_col_idx is None or total_idx is None:
-                continue
-
-            for tr in rows[1:]:
-                tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if len(tds) <= total_idx:
+            for _, row in df.iterrows():
+                raw_stock = str(row[stock_col]).strip()
+                if not raw_stock or raw_stock.lower() in ["nan", "none"]:
                     continue
 
-                raw_stock_info = tds[stock_col_idx]
-                if not raw_stock_info:
-                    continue
+                # 萃取股票代號與名稱（例："2330台積電" 拆為 "2330" 與 "台積電"）
+                code_match = re.search(r"(\d{4,6}[A-Za-z]?)", raw_stock)
+                if code_match:
+                    stock_code = code_match.group(1)
+                    stock_name = raw_stock.replace(stock_code, "").strip()
+                else:
+                    stock_code = raw_stock
+                    stock_name = raw_stock
 
-                tokens = raw_stock_info.split()
-                stock_code = ""
-                stock_name = ""
-                for tok in tokens:
-                    if re.match(r"^\d{4,6}[A-Za-z]?$", tok):
-                        stock_code = tok
-                    elif not stock_name:
-                        stock_name = tok
-
-                if not stock_code:
-                    m = re.search(r"\d{4,6}[A-Za-z]?", raw_stock_info)
-                    if m:
-                        stock_code = m.group(0)
-                        stock_name = raw_stock_info.replace(stock_code, "").strip()
-                    else:
-                        stock_code = raw_stock_info
-                        stock_name = raw_stock_info
-
-                tot_amt_wan = _clean_num(tds[total_idx])
-                tot_vol = int(tot_amt_wan / 10.0) if tot_amt_wan != 0 else 0
+                # 1. 全部官股合計
+                tot_amt = _clean_num(row.get(total_col, 0))
+                tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
 
                 records.append({
                     "交易日期": actual_trade_date,
@@ -248,24 +241,25 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
                     "買進張數": tot_vol if tot_vol > 0 else 0,
                     "賣出張數": abs(tot_vol) if tot_vol < 0 else 0,
                     "買賣超張數": tot_vol,
-                    "金額(萬元)": round(tot_amt_wan, 2)
+                    "金額(萬元)": round(tot_amt, 2)
                 })
 
-                for b_idx, b_name in branch_col_indices.items():
-                    if b_idx < len(tds):
-                        b_amt_wan = _clean_num(tds[b_idx])
-                        b_vol = int(b_amt_wan / 10.0) if b_amt_wan != 0 else 0
-                        if b_amt_wan != 0:
-                            records.append({
-                                "交易日期": actual_trade_date,
-                                "官股分點": b_name,
-                                "代號": stock_code,
-                                "名稱": stock_name,
-                                "買進張數": b_vol if b_vol > 0 else 0,
-                                "賣出張數": abs(b_vol) if b_vol < 0 else 0,
-                                "買賣超張數": b_vol,
-                                "金額(萬元)": round(b_amt_wan, 2)
-                            })
+                # 2. 8 大實體分點
+                for s_b, col_name in branch_cols.items():
+                    b_full = HISTOCK_BRANCH_COLS[s_b]
+                    b_amt = _clean_num(row.get(col_name, 0))
+                    b_vol = int(b_amt / 10.0) if b_amt != 0 else 0
+                    if b_amt != 0:
+                        records.append({
+                            "交易日期": actual_trade_date,
+                            "官股分點": b_full,
+                            "代號": stock_code,
+                            "名稱": stock_name,
+                            "買進張數": b_vol if b_vol > 0 else 0,
+                            "賣出張數": abs(b_vol) if b_vol < 0 else 0,
+                            "買賣超張數": b_vol,
+                            "金額(萬元)": round(b_amt, 2)
+                        })
 
         if records:
             res_df = pd.DataFrame(records).drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
@@ -274,7 +268,7 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
         return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未抓到有效數據列"
 
     except Exception as e:
-        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"連線例外: {str(e)}"
+        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"解析例外: {str(e)}"
 
 def sync_df_to_storage(df: pd.DataFrame) -> bool:
     """持久化保存至本地 CSV 與 Google Drive"""

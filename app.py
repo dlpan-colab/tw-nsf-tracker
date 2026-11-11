@@ -1,16 +1,14 @@
 """
 模組名稱：app.py
-版本識別：20261111_1410
+版本識別：20261111_2250
 修改目的：
-1. 更新版本識別為台灣時間 20261111_1410，與 data_loader.py 嚴格對齊。
-2. 在側邊欄按鈕觸發時加入明確 print 日誌，確保前台點擊即時反映在後台 Manage app 視窗。
-3. 強制調用最新 fetch_histock_latest_gov_trades 函式，防止舊版呼叫殘留。
+1. 更新版本識別為台灣時間 20261111_2250，與 data_loader.py 嚴格對齊。
+2. 側邊欄點擊按鈕時觸發日誌診斷模式，接收 data_loader 回傳的表格欄位診斷資訊。
 防呆防錯原因：
-1. 避免 Streamlit 在模組未全部對齊時調用舊快取函式，導致日誌未印出。
-2. 保持日常純讀取原則，資料入庫後即刻刷新展示。
+1. 避免前台靜默無感，點擊後於前台呈現診斷提示，並於後台 log 印出詳細結構。
 """
 
-MODULE_VERSION = "20261111_1410"
+MODULE_VERSION = "20261111_2250"
 
 import streamlit as st
 import datetime
@@ -101,10 +99,13 @@ st.sidebar.markdown("---")
 st.sidebar.header("官股資料維護與回補")
 
 if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_container_width=True):
-    print("\n[APP] >>> 使用者點擊【抓取 HiStock 最新真實官股結算】按鈕，開始執行...")
-    with st.spinner("正在對接 HiStock 八大官股日報端點..."):
+    print("\n" + "#" * 60)
+    print("[APP] 使用者觸發【抓取 HiStock 最新真實官股結算】，執行診斷日誌...")
+    with st.spinner("正在抓取 HiStock 並於後台輸出解析欄位..."):
         df_real, actual_d, status_msg = fetch_histock_latest_gov_trades()
-        print(f"[APP] 回傳結果：取得 {len(df_real)} 筆，實際日期：{actual_d}，狀態訊息：{status_msg}")
+        print(f"[APP] 執行結果: 取得筆數={len(df_real)}, 日期={actual_d}, 訊息={status_msg}")
+        print("#" * 60 + "\n")
+        
         if not df_real.empty:
             ok = sync_df_to_storage(df_real)
             if ok:
@@ -114,10 +115,10 @@ if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_containe
             else:
                 st.sidebar.error("寫入 Google Drive 失敗，請檢查憑證。")
         else:
-            st.sidebar.error(f"抓取失敗：{status_msg}")
+            st.sidebar.info(f"診斷日誌已輸出至後台（Manage app）。前台回報：{status_msg}")
 
 if st.sidebar.button("🗑️ 清除歷史資料庫", use_container_width=True):
-    print("\n[APP] >>> 使用者點擊【清除歷史資料庫】按鈕...")
+    print("\n[APP] 使用者觸發【清除歷史資料庫】...")
     if purge_gov_database():
         st.sidebar.success("已成功清空本機與雲端舊資料庫！")
         st.rerun()

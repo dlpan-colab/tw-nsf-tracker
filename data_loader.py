@@ -1,24 +1,26 @@
 """
 模組名稱：data_loader.py
-版本識別：20261111_1355
+版本識別：20261111_1402
 修改目的：
-1. 更新版本識別為台灣時間 20261111_1355。
-2. 廢除脆弱的 BeautifulSoup 節點比對，改採 pd.read_html 原生解析 HiStock 八大官股買賣超表格。
-3. 支援代號與名稱自黏合文字（如 2330台積電）精準正則萃取。
-4. 完整抓取 8 大分點（合庫、土銀、台銀、台企銀、第一金、兆豐、華南、彰銀）及全部官股合計。
-5. 金額統一為「萬元」，張數為整數。
+1. 更新版本識別為台灣時間 20261111_1402。
+2. 在 fetch_histock_latest_gov_trades 內部植入透明診斷日誌（print 輸出）：
+   - 輸出 HTTP 狀態碼
+   - 輸出 HTML 下載長度
+   - 輸出解析到的 HTML 表格數量與欄位名稱
+3. 協助使用者直接在 Streamlit Cloud 後台黑底日誌視窗（Manage app）精準確認 HiStock 頁面真實狀況。
 防呆防錯原因：
-1. 頁面若因廣告、iframe 或標籤改動，pd.read_html 能直接還原表格陣列，避免 DOM 結構變更引發未抓到數據錯誤。
-2. 遇到空表、非交易日或無數值情況，如實回傳空結構並記錄原因，絕不使用假資料替代。
+1. 避免底層連線異常或表格變更時靜默吞掉錯誤，提供透明除錯資訊，杜絕推測。
+2. 保持落盤與歷史庫欄位單位統一（金額為萬元，張數為整數）。
 """
 
-MODULE_VERSION = "20261111_1355"
+MODULE_VERSION = "20261111_1402"
 
 import os
 import re
 import json
 import time
 import datetime
+import traceback
 from io import StringIO
 from zoneinfo import ZoneInfo
 import requests
@@ -156,16 +158,19 @@ def _clean_num(val) -> float:
 
 def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
     """
-    自 HiStock 抓取最新八大官股結算日報 (透過 pd.read_html 穩定解析)
+    自 HiStock 抓取最新八大官股結算日報並打印底層診斷日誌
     回傳: (DataFrame, 實際交易日期, 狀態說明)
     """
     url = "https://histock.tw/stock/broker8.aspx"
+    print("\n" + "=" * 50)
+    print(f"[DEBUG_HISTOCK] 開始請求 HiStock 官股網址: {url}")
     try:
         resp = requests.get(url, headers=REQ_HEADERS, timeout=12)
+        print(f"[DEBUG_HISTOCK] HTTP 回應狀態碼: {resp.status_code}, 內容長度: {len(resp.text)} 字元")
         if resp.status_code != 200 or not resp.text:
             return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"連線異常 HTTP {resp.status_code}"
 
-        # 1. 解析實際發布日期
+        # 1. 萃取日期
         soup = BeautifulSoup(resp.text, "html.parser")
         page_text = soup.get_text()
         date_match = re.search(r"(\d{2})[-/](\d{2})\s+Top\s+30\s+八大", page_text)
@@ -174,29 +179,32 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
         if date_match:
             mm, dd = date_match.group(1), date_match.group(2)
             actual_trade_date = f"{current_year}-{mm}-{dd}"
+            print(f"[DEBUG_HISTOCK] 成功辨識網頁發布交易日期: {actual_trade_date}")
         else:
             actual_trade_date = get_tw_today().strftime("%Y-%m-%d")
+            print(f"[DEBUG_HISTOCK] 未找到標題日期特徵，預設使用台灣今日: {actual_trade_date}")
 
-        # 2. 原生解析 HTML 表格
+        # 2. 原生解析表格
         dfs = pd.read_html(StringIO(resp.text))
-        if not dfs:
-            return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未解析到任何 HTML 表格"
+        print(f"[DEBUG_HISTOCK] pd.read_html 解析到的表格數量: {len(dfs)}")
 
         records = []
-        for df in dfs:
-            # 扁平化多重表頭
+        for idx, df in enumerate(dfs):
+            # 扁平化表頭
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = ['_'.join(str(c) for c in col).strip() for col in df.columns]
             else:
                 df.columns = [str(c).strip() for c in df.columns]
 
             cols_str = " ".join(df.columns)
-            # 確認是否為官股明細表（至少包含兩個行庫簡稱與合計）
-            matched_branches = {short: full for short, full in HISTOCK_BRANCH_COLS.items() if short in cols_str}
-            if len(matched_branches) < 2 or not any("合計" in c for c in df.columns):
+            matched_branches = [s for s in HISTOCK_BRANCH_COLS.keys() if s in cols_str]
+            has_total = any("合計" in c for c in df.columns)
+
+            print(f"[DEBUG_HISTOCK] 表格 #{idx} 欄位數: {len(df.columns)}, 列數: {len(df)}, 配對分點: {matched_branches}, 包含合計: {has_total}")
+
+            if len(matched_branches) < 2 or not has_total:
                 continue
 
-            # 定位股票代號欄位與合計欄位
             stock_col = None
             total_col = None
             branch_cols = {}
@@ -211,16 +219,17 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
                         branch_cols[s_b] = col
 
             if stock_col is None and len(df.columns) >= 2:
-                stock_col = df.columns[1]  # 通常第 0 欄是排行，第 1 欄是股票
+                stock_col = df.columns[1]
             if total_col is None:
                 total_col = df.columns[-1]
+
+            print(f"[DEBUG_HISTOCK] 目標表格 #{idx} 鎖定欄位 -> 股票欄: {stock_col}, 合計欄: {total_col}")
 
             for _, row in df.iterrows():
                 raw_stock = str(row[stock_col]).strip()
                 if not raw_stock or raw_stock.lower() in ["nan", "none"]:
                     continue
 
-                # 萃取股票代號與名稱（例："2330台積電" 拆為 "2330" 與 "台積電"）
                 code_match = re.search(r"(\d{4,6}[A-Za-z]?)", raw_stock)
                 if code_match:
                     stock_code = code_match.group(1)
@@ -229,7 +238,6 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
                     stock_code = raw_stock
                     stock_name = raw_stock
 
-                # 1. 全部官股合計
                 tot_amt = _clean_num(row.get(total_col, 0))
                 tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
 
@@ -244,7 +252,6 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
                     "金額(萬元)": round(tot_amt, 2)
                 })
 
-                # 2. 8 大實體分點
                 for s_b, col_name in branch_cols.items():
                     b_full = HISTOCK_BRANCH_COLS[s_b]
                     b_amt = _clean_num(row.get(col_name, 0))
@@ -261,6 +268,9 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
                             "金額(萬元)": round(b_amt, 2)
                         })
 
+        print(f"[DEBUG_HISTOCK] 總計解析有效記錄數: {len(records)}")
+        print("=" * 50 + "\n")
+
         if records:
             res_df = pd.DataFrame(records).drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
             return res_df, actual_trade_date, f"成功解析 {len(res_df)} 筆真實數據"
@@ -268,6 +278,9 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str]:
         return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未抓到有效數據列"
 
     except Exception as e:
+        print(f"[DEBUG_HISTOCK] 解析拋出例外: {e}")
+        traceback.print_exc()
+        print("=" * 50 + "\n")
         return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"解析例外: {str(e)}"
 
 def sync_df_to_storage(df: pd.DataFrame) -> bool:

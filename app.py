@@ -1,16 +1,16 @@
 """
 模組名稱：app.py
-版本識別：20261110_1010
+版本識別：20261111_1410
 修改目的：
-1. 更新版本識別為台灣時間 20261110_1010。
-2. 全面導入 zoneinfo (Asia/Taipei)，大盤日曆與預設選單皆依台灣標準時間對齊。
-3. 側邊欄「執行真實官股回補」提供前台即時診斷與落盤回報，操作日誌公開透明。
-4. 維持嚴格的日常純讀取原則，絕不私自捏造資料。
+1. 更新版本識別為台灣時間 20261111_1410，與 data_loader.py 嚴格對齊。
+2. 在側邊欄按鈕觸發時加入明確 print 日誌，確保前台點擊即時反映在後台 Manage app 視窗。
+3. 強制調用最新 fetch_histock_latest_gov_trades 函式，防止舊版呼叫殘留。
 防呆防錯原因：
-1. 回補成功後顯示抓取到的實際交易日期與總筆數，並自動 st.rerun() 刷新全域快取。
+1. 避免 Streamlit 在模組未全部對齊時調用舊快取函式，導致日誌未印出。
+2. 保持日常純讀取原則，資料入庫後即刻刷新展示。
 """
 
-MODULE_VERSION = "20261110_1010"
+MODULE_VERSION = "20261111_1410"
 
 import streamlit as st
 import datetime
@@ -68,7 +68,6 @@ div[data-testid="stHorizontalBlock"] > div {
 st.caption(f"系統版本識別（台灣時間）：{SYSTEM_VERSION}")
 st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
-# 1. 初始化 Session State（強制綁定台灣時區）
 today_tw = get_tw_today()
 
 if "focus_target_idx" not in st.session_state:
@@ -102,8 +101,10 @@ st.sidebar.markdown("---")
 st.sidebar.header("官股資料維護與回補")
 
 if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_container_width=True):
+    print("\n[APP] >>> 使用者點擊【抓取 HiStock 最新真實官股結算】按鈕，開始執行...")
     with st.spinner("正在對接 HiStock 八大官股日報端點..."):
         df_real, actual_d, status_msg = fetch_histock_latest_gov_trades()
+        print(f"[APP] 回傳結果：取得 {len(df_real)} 筆，實際日期：{actual_d}，狀態訊息：{status_msg}")
         if not df_real.empty:
             ok = sync_df_to_storage(df_real)
             if ok:
@@ -116,6 +117,7 @@ if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_containe
             st.sidebar.error(f"抓取失敗：{status_msg}")
 
 if st.sidebar.button("🗑️ 清除歷史資料庫", use_container_width=True):
+    print("\n[APP] >>> 使用者點擊【清除歷史資料庫】按鈕...")
     if purge_gov_database():
         st.sidebar.success("已成功清空本機與雲端舊資料庫！")
         st.rerun()
@@ -216,7 +218,6 @@ else:
     if selected_bank != "全部官股合計":
         day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
     else:
-        # 由當日 8 大分點加總彙算
         day_target_df = single_day_df[single_day_df["官股分點"] != "全部官股合計"].groupby(["代號", "名稱"], as_index=False).agg({
             "買進張數": "sum",
             "賣出張數": "sum",

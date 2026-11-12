@@ -1,145 +1,177 @@
 """
-模組名稱：app.py（HiStock 八大官股 ul.stock-list 解析驗算測試版 - 不寫入資料庫）
-版本識別：20261112_1543_PARSE_VERIFY
+模組名稱：app.py（個股券商分點區間買賣超探測測試版 - 驗證 10/7 ~ 11/6 抓取與官股分點過濾）
+版本識別：20261112_1606_BROKER_RANGE_TEST
 修改目的：
-1. 依據實測確認之 DOM 結構（<table class="gvTB"> 表頭 + <ul class="stock-list"><li><span> 資料列），
-   實作完整解析器，抓取買超 Top 30 與賣超 Top 30 共 60 筆八大官股個股明細（含完整交易日期、股票代號、股票名稱、
-   八大行庫各自買賣超金額及合計萬元）。
-2. 於手機前台畫面直接呈現解析後的 60 筆 DataFrame 表格與自動加總驗算結果，供肉眼最終確認（不寫入資料庫）。
+1. 驗證輸入「股票代碼（預設 2308 台達電）」與「期間（2026-10-07 ~ 2026-11-06）」時，各公開財經資料源之連線可用性與區間分點資料結構。
+2. 測試候選資料源包含：
+   - 來源 A：富邦證券公開網頁分點進出（fubon-ebrokerdj.fbs.com.tw，支援自訂起迄日期區間查詢）
+   - 來源 B：凱基證券公開網頁分點進出（kgieworld.moneydj.com，支援自訂起迄日期區間查詢）
+   - 來源 C：HiStock 個股分點進出頁面（histock.tw/stock/broker.aspx）
+3. 自動比對「八大官股分點關鍵字與券商代號」，於手機前台呈現「全部買賣超分點」與「八大官股各地分點」篩選結果（不寫入資料庫）。
 防呆防錯原因：
-1. 優先從 <li title="2026-11-11 ..."> 屬性擷取完整西元年月日，並從 onclick='goUrl("2308");' 精準提取股票代號，
-   避免僅靠頁面標題只有 MM-DD 導致跨年日期誤判。
-2. 逐筆將八大行庫金額轉為數值並比對加總與「合計(萬)」欄位（容許四捨五入 ±2 萬元誤差），防止欄位錯位。
+1. 採用台灣標準時間（Asia/Taipei），預設期間鎖定 2026-10-07 至 2026-11-06。
+2. 券商分點網頁多採 Big5/CP950 編碼，程式內強制處理編碼解碼與千分位清理，避免亂碼或解析中斷。
+3. 各來源獨立 try-except 隔離，單一網站阻擋或逾時不影響其他來源測試。
 """
 
 import re
+import datetime
+from io import StringIO
+from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 
-TEST_VERSION = "20261112_1543_PARSE_VERIFY"
-DEFAULT_URL = "https://histock.tw/stock/broker8.aspx"
+TW_TZ = ZoneInfo("Asia/Taipei")
+TEST_VERSION = "20261112_1606_BROKER_RANGE_TEST"
 
-st.set_page_config(page_title="HiStock 60筆解析驗算器", layout="wide")
-st.caption(f"解析驗算版本（台灣時間）：{TEST_VERSION}")
-st.subheader("✅ HiStock 八大官股 Top 30 買超/賣超（共 60 筆）解析驗算")
-st.info("本程式僅做即時抓取解析與前端表格驗算，不會寫入或更動任何資料庫。")
+st.set_page_config(page_title="個股分點區間探測器", layout="wide")
+st.caption(f"探測版本（台灣時間）：{TEST_VERSION}")
+st.subheader("🔍 個股券商分點區間買賣超探測（10/07 ~ 11/06）")
+st.info("本程式僅做資料源與區間分點解析驗證，不會寫入任何資料庫。")
 
-target_url = st.text_input("目標網址（可附加 ?d=YYYY-MM-DD 測試歷史日期）", value=DEFAULT_URL)
+col_in1, col_in2, col_in3 = st.columns(3)
+with col_in1:
+    stock_id = st.text_input("輸入 1：股票代碼", value="2308").strip()
+with col_in2:
+    start_date = st.date_input("輸入 2（起日）", value=datetime.date(2026, 10, 7))
+with col_in3:
+    end_date = st.date_input("輸入 2（迄日）", value=datetime.date(2026, 11, 6))
 
 REQ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://histock.tw/"
 }
 
-BANK_COLS = ["合庫", "土銀", "台銀", "台企銀", "彰銀", "第一金", "兆豐銀", "華南永昌"]
+# 八大官股券商名稱前綴識別（涵蓋總公司與所有地方分點，例如：兆豐-大同、華南永昌-豐原）
+GOV_BROKER_PREFIXES = (
+    "合庫", "合作金庫",
+    "土銀", "土地銀行",
+    "台銀", "臺銀", "台灣銀行", "臺灣銀行",
+    "台企", "臺企", "台灣企銀", "臺灣企銀",
+    "彰銀", "彰化銀行",
+    "第一金",
+    "兆豐",
+    "華南永昌"
+)
 
 
-def clean_num(val_str: str) -> int:
-    """移除千分位逗號與空白並轉為整數，防呆處理空值或橫線"""
-    cleaned = re.sub(r"[,\s\xa0]", "", val_str or "")
-    if cleaned in ("", "-", "--", "—"):
-        return 0
-    return int(float(cleaned))
+def is_gov_broker(broker_name: str) -> bool:
+    """判斷分點名稱是否隸屬於八大官股體系"""
+    clean_name = str(broker_name).strip()
+    return any(clean_name.startswith(prefix) for prefix in GOV_BROKER_PREFIXES)
 
 
-def parse_histock_broker8(html_text: str) -> pd.DataFrame:
-    """解析 HiStock 八大官股買超 Top 30 與賣超 Top 30 完整明細"""
+def parse_moneydj_broker_table(html_text: str, source_label: str):
+    """解析 MoneyDJ 架構券商分點區間進出表格（左右雙欄：買超分點 / 賣超分點）"""
     soup = BeautifulSoup(html_text, "html.parser")
-    stock_lists = soup.find_all("ul", class_="stock-list")
+    tables = soup.find_all("table")
+    st.write(f"**{source_label}** 偵測到 `<table>` 總數：`{len(tables)}`")
 
-    if len(stock_lists) < 2:
-        raise ValueError(f"預期至少 2 組 ul.stock-list（買超/賣超），實際僅找到 {len(stock_lists)} 組。")
+    buy_rows = []
+    sell_rows = []
 
-    categories = ["買超", "賣超"]
-    records = []
+    for tbl in tables:
+        rows = tbl.find_all("tr")
+        for tr in rows:
+            tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+            # MoneyDJ 標準區間分點表通常為 8 欄（左側4欄買超：券商、買進、賣出、買賣超；右側4欄賣超：券商、買進、賣出、買賣超）
+            # 或 10 欄（含佔比）
+            if len(tds) in (8, 10):
+                half = len(tds) // 2
+                left = tds[:half]
+                right = tds[half:]
+                if left[0] and left[0] not in ("買超券商", "券商名稱", "分點") and any(c.isdigit() for c in left[-1]):
+                    buy_rows.append(left)
+                if right[0] and right[0] not in ("賣超券商", "券商名稱", "分點") and any(c.isdigit() for c in right[-1]):
+                    sell_rows.append(right)
 
-    for idx, ul in enumerate(stock_lists[:2]):
-        category = categories[idx]
-        li_items = ul.find_all("li", recursive=False)
-
-        for rank_idx, li in enumerate(li_items, start=1):
-            # 1. 從 title 屬性擷取完整交易日期（例如：2026-11-11）
-            title_attr = li.get("title", "")
-            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title_attr)
-            trade_date = date_match.group(1) if date_match else "未知日期"
-
-            # 2. 從 onclick='goUrl("2308");' 擷取股票代號
-            onclick_attr = li.get("onclick", "")
-            code_match = re.search(r'goUrl\(["\']([^"\']+)["\']\)', onclick_attr)
-            stock_code = code_match.group(1).strip() if code_match else ""
-
-            # 3. 取得直接子層 <span>（排除名次內層的 <span class="top ..."> 干擾）
-            spans = li.find_all("span", recursive=False)
-            if len(spans) < 11:
-                continue
-
-            stock_name = spans[1].get_text(strip=True).replace("\xa0", "")
-            bank_values = [clean_num(spans[i].get_text(strip=True)) for i in range(2, 10)]
-            reported_total = clean_num(spans[10].get_text(strip=True))
-            calc_sum = sum(bank_values)
-            diff = reported_total - calc_sum
-
-            row = {
-                "交易日期": trade_date,
-                "類別": category,
-                "名次": rank_idx,
-                "代號": stock_code,
-                "股票名稱": stock_name,
-                "合庫": bank_values[0],
-                "土銀": bank_values[1],
-                "台銀": bank_values[2],
-                "台企銀": bank_values[3],
-                "彰銀": bank_values[4],
-                "第一金": bank_values[5],
-                "兆豐銀": bank_values[6],
-                "華南永昌": bank_values[7],
-                "合計(萬)": reported_total,
-                "八行加總驗算": calc_sum,
-                "四捨五入差額": diff,
-            }
-            records.append(row)
-
-    return pd.DataFrame(records)
+    return buy_rows, sell_rows
 
 
-if st.button("🚀 執行解析並顯示 60 筆驗算明細", type="primary", use_container_width=True):
-    with st.spinner("正在連線 HiStock 並解析 60 筆個股數據..."):
-        try:
-            resp = requests.get(target_url, headers=REQ_HEADERS, timeout=15)
-            if resp.status_code != 200 or not resp.text:
-                st.error(f"HTTP 連線異常，狀態碼：{resp.status_code}")
-                st.stop()
+if st.button("🚀 執行 10/07 ~ 11/06 分點區間探測", type="primary", use_container_width=True):
+    s_str = start_date.strftime("%Y-%m-%d")
+    e_str = end_date.strftime("%Y-%m-%d")
+    # MoneyDJ 系統常用 YYYY-M-D 無補零格式
+    s_mdj = f"{start_date.year}-{start_date.month}-{start_date.day}"
+    e_mdj = f"{end_date.year}-{end_date.month}-{end_date.day}"
 
-            df_result = parse_histock_broker8(resp.text)
+    # ---------------------------------------------------------
+    # 來源 A：富邦證券公開分點區間查詢（MoneyDJ 引擎）
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 A：富邦證券分點區間查詢（`fubon-ebrokerdj.fbs.com.tw`）")
+    fubon_url = f"https://fubon-ebrokerdj.fbs.com.tw/z/zc/zco/zco.djhtm?a={stock_id}&e={s_mdj}&f={e_mdj}"
+    st.code(fubon_url, language="text")
+    try:
+        resp_a = requests.get(fubon_url, headers=REQ_HEADERS, timeout=15)
+        resp_a.encoding = "big5"
+        st.write(f"HTTP 狀態：**{resp_a.status_code}** ｜ 回傳長度：**{len(resp_a.text):,}** 字元")
+        if resp_a.status_code == 200:
+            buy_a, sell_a = parse_moneydj_broker_table(resp_a.text, "富邦分點")
+            st.write(f"解析結果：買超分點 **{len(buy_a)}** 筆 ｜ 賣超分點 **{len(sell_a)}** 筆")
+            if buy_a or sell_a:
+                cols_name = ["分點名稱", "買進(張)", "賣出(張)", "買賣超(張)", "佔比"][:len(buy_a[0] if buy_a else sell_a[0])]
+                df_buy_a = pd.DataFrame(buy_a, columns=cols_name)
+                df_sell_a = pd.DataFrame(sell_a, columns=cols_name)
 
-            if df_result.empty:
-                st.error("解析結果為 0 筆，請檢查網頁結構是否變動。")
-                st.stop()
-
-            buy_df = df_result[df_result["類別"] == "買超"]
-            sell_df = df_result[df_result["類別"] == "賣超"]
-            max_diff = df_result["四捨五入差額"].abs().max()
-
-            # 驗算摘要指標卡片
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("總解析筆數", f"{len(df_result)} 筆")
-            c2.metric("買超 / 賣超", f"{len(buy_df)} / {len(sell_df)} 筆")
-            c3.metric("辨識交易日", df_result["交易日期"].iloc[0])
-            c4.metric("最大加總誤差", f"±{max_diff} 萬")
-
-            if max_diff <= 4:
-                st.success("結構與數值驗算通過：八大行庫加總與官方「合計(萬)」欄位完全吻合（僅存個位數四捨五入差）。")
+                st.success("✅ 成功抓回區間分點資料！以下為預覽：")
+                t1, t2 = st.tabs(["輸出 1：全部買賣超分點（前15名）", "輸出 2：八大官股各地分點篩選"])
+                with t1:
+                    st.write("**買超分點 Top 15**")
+                    st.dataframe(df_buy_a.head(15), use_container_width=True)
+                    st.write("**賣超分點 Top 15**")
+                    st.dataframe(df_sell_a.head(15), use_container_width=True)
+                with t2:
+                    gov_buy = df_buy_a[df_buy_a["分點名稱"].apply(is_gov_broker)]
+                    gov_sell = df_sell_a[df_sell_a["分點名稱"].apply(is_gov_broker)]
+                    st.write(f"**八大官股買超分點（共 {len(gov_buy)} 家）**")
+                    st.dataframe(gov_buy, use_container_width=True)
+                    st.write(f"**八大官股賣超分點（共 {len(gov_sell)} 家）**")
+                    st.dataframe(gov_sell, use_container_width=True)
             else:
-                st.warning(f"發現部分列加總差額達 {max_diff} 萬，請檢查下方明細。")
+                st.warning("未匹配到標準分點列，前 600 字元預覽：")
+                st.code(resp_a.text[:600], language="html")
+    except Exception as e:
+        st.error(f"來源 A 連線或解析異常：{e}")
 
-            # 完整 60 筆明細呈現（設定高高度讓手機可直接上下捲動檢視全部 60 列）
-            st.markdown("### 完整 60 筆解析明細表（買超 Top 1~30 + 賣超 Top 1~30）")
-            st.dataframe(df_result, use_container_width=True, height=900)
+    # ---------------------------------------------------------
+    # 來源 B：凱基證券公開分點區間查詢（備援通道）
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 B：凱基證券分點區間查詢（`kgieworld.moneydj.com`）")
+    kgi_url = f"https://kgieworld.moneydj.com/z/zc/zco/zco.djhtm?a={stock_id}&e={s_mdj}&f={e_mdj}"
+    st.code(kgi_url, language="text")
+    try:
+        resp_b = requests.get(kgi_url, headers=REQ_HEADERS, timeout=15)
+        resp_b.encoding = "big5"
+        st.write(f"HTTP 狀態：**{resp_b.status_code}** ｜ 回傳長度：**{len(resp_b.text):,}** 字元")
+        if resp_b.status_code == 200:
+            buy_b, sell_b = parse_moneydj_broker_table(resp_b.text, "凱基分點")
+            st.write(f"解析結果：買超分點 **{len(buy_b)}** 筆 ｜ 賣超分點 **{len(sell_b)}** 筆")
+    except Exception as e:
+        st.error(f"來源 B 連線異常：{e}")
 
-        except Exception as e:
-            st.error(f"解析過程發生例外：{e}")
-            st.exception(e)
+    # ---------------------------------------------------------
+    # 來源 C：HiStock 個股分點進出頁面
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 C：HiStock 個股分點進出（`histock.tw/stock/broker.aspx`）")
+    histock_broker_url = f"https://histock.tw/stock/broker.aspx?no={stock_id}"
+    st.code(histock_broker_url, language="text")
+    try:
+        resp_c = requests.get(histock_broker_url, headers=REQ_HEADERS, timeout=15)
+        st.write(f"HTTP 狀態：**{resp_c.status_code}** ｜ 回傳長度：**{len(resp_c.text):,}** 字元")
+        if resp_c.status_code == 200:
+            soup_c = BeautifulSoup(resp_c.text, "html.parser")
+            uls = soup_c.find_all("ul", class_="stock-list")
+            st.write(f"偵測到 `ul.stock-list` 數量：**{len(uls)}**")
+            if uls:
+                first_li = uls[0].find("li")
+                if first_li:
+                    st.write("第一列原始文字預覽：")
+                    st.code(" | ".join(first_li.stripped_strings), language="text")
+    except Exception as e:
+        st.error(f"來源 C 連線異常：{e}")

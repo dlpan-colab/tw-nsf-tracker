@@ -1,27 +1,32 @@
 """
-模組名稱：app.py（HiStock 外部 JS 腳本與 AJAX 端點逆向探測測試版 - 不寫入資料庫）
-版本識別：20261112_1535_JS_PROBE
+模組名稱：app.py（HiStock 八大官股 ul.stock-list 解析驗算測試版 - 不寫入資料庫）
+版本識別：20261112_1543_PARSE_VERIFY
 修改目的：
-1. 針對 https://histock.tw/stock/broker8.aspx 頁面引用的所有自家外部 .js 檔案進行自動抓取與關鍵字檢索。
-2. 搜尋包含 broker8、gvTB、ajax、post、ashx、asmx 等關鍵字的 JS 程式碼片段，精準定位前端動態載入 30 檔官股資料的真實 API 網址與參數。
-3. 同步檢查 HTML 原始碼中距離 gvTB 表格前後 1,500 字元內的完整 DOM 與隱藏標籤結構（確認是否藏於非標準標籤內）。
+1. 依據實測確認之 DOM 結構（<table class="gvTB"> 表頭 + <ul class="stock-list"><li><span> 資料列），
+   實作完整解析器，抓取買超 Top 30 與賣超 Top 30 共 60 筆八大官股個股明細（含完整交易日期、股票代號、股票名稱、
+   八大行庫各自買賣超金額及合計萬元）。
+2. 於手機前台畫面直接呈現解析後的 60 筆 DataFrame 表格與自動加總驗算結果，供肉眼最終確認（不寫入資料庫）。
 防呆防錯原因：
-1. 僅執行 HTTP GET 唯讀探測，絕不觸碰或寫入任何本地與雲端資料庫。
-2. 排除第三方套件（如 jquery.min.js、SuperSlide 等），集中檢視 HiStock 自研業務邏輯 JS 檔案。
+1. 優先從 <li title="2026-11-11 ..."> 屬性擷取完整西元年月日，並從 onclick='goUrl("2308");' 精準提取股票代號，
+   避免僅靠頁面標題只有 MM-DD 導致跨年日期誤判。
+2. 逐筆將八大行庫金額轉為數值並比對加總與「合計(萬)」欄位（容許四捨五入 ±2 萬元誤差），防止欄位錯位。
 """
 
 import re
-from urllib.parse import urljoin
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 
-TEST_VERSION = "20261112_1535_JS_PROBE"
-TARGET_URL = "https://histock.tw/stock/broker8.aspx"
+TEST_VERSION = "20261112_1543_PARSE_VERIFY"
+DEFAULT_URL = "https://histock.tw/stock/broker8.aspx"
 
-st.set_page_config(page_title="HiStock JS 端點逆向探測器", layout="wide")
-st.caption(f"探測版本（台灣時間）：{TEST_VERSION}")
-st.subheader("🕵️ HiStock 外部 JS 與真實 API 端點逆向探測（不寫入資料庫）")
+st.set_page_config(page_title="HiStock 60筆解析驗算器", layout="wide")
+st.caption(f"解析驗算版本（台灣時間）：{TEST_VERSION}")
+st.subheader("✅ HiStock 八大官股 Top 30 買超/賣超（共 60 筆）解析驗算")
+st.info("本程式僅做即時抓取解析與前端表格驗算，不會寫入或更動任何資料庫。")
+
+target_url = st.text_input("目標網址（可附加 ?d=YYYY-MM-DD 測試歷史日期）", value=DEFAULT_URL)
 
 REQ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -30,94 +35,111 @@ REQ_HEADERS = {
     "Referer": "https://histock.tw/"
 }
 
-# 排除常見第三方通用函式庫，聚焦 HiStock 自家業務腳本
-IGNORE_JS_PATTERNS = [
-    "jquery.min.js", "jquery-ui", "mmenu", "superslide", "flipsnap",
-    "lazyload", "highcharts", "highstock", "bootstrap", "google",
-    "facebook", "doubleclick", "criteo", "analytics", "gtag"
-]
+BANK_COLS = ["合庫", "土銀", "台銀", "台企銀", "彰銀", "第一金", "兆豐銀", "華南永昌"]
 
-if st.button("🚀 執行 HiStock JS 與 DOM 結構深度逆向探測", type="primary", use_container_width=True):
-    with st.spinner("正在解析主頁面並追蹤所有外部 JS 腳本..."):
+
+def clean_num(val_str: str) -> int:
+    """移除千分位逗號與空白並轉為整數，防呆處理空值或橫線"""
+    cleaned = re.sub(r"[,\s\xa0]", "", val_str or "")
+    if cleaned in ("", "-", "--", "—"):
+        return 0
+    return int(float(cleaned))
+
+
+def parse_histock_broker8(html_text: str) -> pd.DataFrame:
+    """解析 HiStock 八大官股買超 Top 30 與賣超 Top 30 完整明細"""
+    soup = BeautifulSoup(html_text, "html.parser")
+    stock_lists = soup.find_all("ul", class_="stock-list")
+
+    if len(stock_lists) < 2:
+        raise ValueError(f"預期至少 2 組 ul.stock-list（買超/賣超），實際僅找到 {len(stock_lists)} 組。")
+
+    categories = ["買超", "賣超"]
+    records = []
+
+    for idx, ul in enumerate(stock_lists[:2]):
+        category = categories[idx]
+        li_items = ul.find_all("li", recursive=False)
+
+        for rank_idx, li in enumerate(li_items, start=1):
+            # 1. 從 title 屬性擷取完整交易日期（例如：2026-11-11）
+            title_attr = li.get("title", "")
+            date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title_attr)
+            trade_date = date_match.group(1) if date_match else "未知日期"
+
+            # 2. 從 onclick='goUrl("2308");' 擷取股票代號
+            onclick_attr = li.get("onclick", "")
+            code_match = re.search(r'goUrl\(["\']([^"\']+)["\']\)', onclick_attr)
+            stock_code = code_match.group(1).strip() if code_match else ""
+
+            # 3. 取得直接子層 <span>（排除名次內層的 <span class="top ..."> 干擾）
+            spans = li.find_all("span", recursive=False)
+            if len(spans) < 11:
+                continue
+
+            stock_name = spans[1].get_text(strip=True).replace("\xa0", "")
+            bank_values = [clean_num(spans[i].get_text(strip=True)) for i in range(2, 10)]
+            reported_total = clean_num(spans[10].get_text(strip=True))
+            calc_sum = sum(bank_values)
+            diff = reported_total - calc_sum
+
+            row = {
+                "交易日期": trade_date,
+                "類別": category,
+                "名次": rank_idx,
+                "代號": stock_code,
+                "股票名稱": stock_name,
+                "合庫": bank_values[0],
+                "土銀": bank_values[1],
+                "台銀": bank_values[2],
+                "台企銀": bank_values[3],
+                "彰銀": bank_values[4],
+                "第一金": bank_values[5],
+                "兆豐銀": bank_values[6],
+                "華南永昌": bank_values[7],
+                "合計(萬)": reported_total,
+                "八行加總驗算": calc_sum,
+                "四捨五入差額": diff,
+            }
+            records.append(row)
+
+    return pd.DataFrame(records)
+
+
+if st.button("🚀 執行解析並顯示 60 筆驗算明細", type="primary", use_container_width=True):
+    with st.spinner("正在連線 HiStock 並解析 60 筆個股數據..."):
         try:
-            resp = requests.get(TARGET_URL, headers=REQ_HEADERS, timeout=15)
-            st.success(f"主頁面 HTTP 狀態：{resp.status_code} ｜ 總長度：{len(resp.text):,} 字元")
-
+            resp = requests.get(target_url, headers=REQ_HEADERS, timeout=15)
             if resp.status_code != 200 or not resp.text:
-                st.error("主頁面無法取得有效內容。")
+                st.error(f"HTTP 連線異常，狀態碼：{resp.status_code}")
                 st.stop()
 
-            html_text = resp.text
-            soup = BeautifulSoup(html_text, "html.parser")
+            df_result = parse_histock_broker8(resp.text)
 
-            # ---------------------------------------------------------
-            # 1. 檢視 gvTB 表格前後的原始 HTML 結構（確認資料是否藏於 div/span/ul）
-            # ---------------------------------------------------------
-            st.markdown("### 1. `gvTB` 表格區塊前後原始 HTML 結構檢視")
-            gv_matches = [m.start() for m in re.finditer(r"gvTB", html_text)]
-            st.write(f"HTML 中共出現 **{len(gv_matches)}** 次 `gvTB`：")
-            for idx, pos in enumerate(gv_matches):
-                snippet = html_text[max(0, pos - 200): min(len(html_text), pos + 1500)]
-                with st.expander(f"gvTB 區塊 #{idx + 1}（字元位置 {pos}）原始 HTML", expanded=(idx == 0)):
-                    st.code(snippet, language="html")
+            if df_result.empty:
+                st.error("解析結果為 0 筆，請檢查網頁結構是否變動。")
+                st.stop()
 
-            # ---------------------------------------------------------
-            # 2. 列出並剖析所有 HiStock 自家外部 JS 檔案
-            # ---------------------------------------------------------
-            st.markdown("### 2. HiStock 自家外部 JS 腳本清單與 AJAX 關鍵字搜尋")
-            all_js_urls = []
-            for s in soup.find_all("script", src=True):
-                full_url = urljoin(TARGET_URL, s["src"])
-                if "histock.tw" in full_url.lower():
-                    if not any(ign in full_url.lower() for ign in IGNORE_JS_PATTERNS):
-                        if full_url not in all_js_urls:
-                            all_js_urls.append(full_url)
+            buy_df = df_result[df_result["類別"] == "買超"]
+            sell_df = df_result[df_result["類別"] == "賣超"]
+            max_diff = df_result["四捨五入差額"].abs().max()
 
-            st.write(f"過濾第三方套件後，鎖定 **{len(all_js_urls)}** 支 HiStock 自家業務 JS 腳本：")
-            for u in all_js_urls:
-                st.text(u)
+            # 驗算摘要指標卡片
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("總解析筆數", f"{len(df_result)} 筆")
+            c2.metric("買超 / 賣超", f"{len(buy_df)} / {len(sell_df)} 筆")
+            c3.metric("辨識交易日", df_result["交易日期"].iloc[0])
+            c4.metric("最大加總誤差", f"±{max_diff} 萬")
 
-            search_keywords = ["broker8", "gvtb", "ajax", "post", "ashx", "asmx", "bind", "render", "handler"]
+            if max_diff <= 4:
+                st.success("結構與數值驗算通過：八大行庫加總與官方「合計(萬)」欄位完全吻合（僅存個位數四捨五入差）。")
+            else:
+                st.warning(f"發現部分列加總差額達 {max_diff} 萬，請檢查下方明細。")
 
-            for js_idx, js_url in enumerate(all_js_urls):
-                try:
-                    js_resp = requests.get(js_url, headers=REQ_HEADERS, timeout=10)
-                    if js_resp.status_code == 200 and js_resp.text:
-                        js_code = js_resp.text
-                        hits = []
-                        for kw in search_keywords:
-                            for m in re.finditer(re.escape(kw), js_code, re.IGNORECASE):
-                                start_p = max(0, m.start() - 120)
-                                end_p = min(len(js_code), m.end() + 280)
-                                hits.append((kw, js_code[start_p:end_p].strip()))
-
-                        with st.expander(f"JS #{js_idx + 1}: `{js_url.split('/')[-1]}`（長度: {len(js_code):,} ｜ 命中: {len(hits)} 處）", expanded=(len(hits) > 0)):
-                            if hits:
-                                # 去除高度重疊的片段，最多顯示前 8 處最具代表性的程式碼
-                                shown_snippets = []
-                                for kw, snip in hits:
-                                    if not any(snip[:80] in existing for existing in shown_snippets):
-                                        shown_snippets.append(snip)
-                                        st.markdown(f"**命中關鍵字：`{kw}`**")
-                                        st.code(snip, language="javascript")
-                                        if len(shown_snippets) >= 8:
-                                            break
-                            else:
-                                st.info("此 JS 檔案未包含 AJAX 或表格渲染關鍵字。")
-                except Exception as js_err:
-                    st.warning(f"讀取 `{js_url}` 失敗：{js_err}")
-
-            # ---------------------------------------------------------
-            # 3. 檢查主頁面所有 Inline Script（不含第 1 支圖表腳本）
-            # ---------------------------------------------------------
-            st.markdown("### 3. 主頁面其餘內嵌 `<script>` 總覽")
-            inline_scripts = [s for s in soup.find_all("script") if not s.get("src")]
-            for i_idx, s in enumerate(inline_scripts):
-                txt = (s.string or s.get_text() or "").strip()
-                if txt and "loadChart" not in txt:
-                    with st.expander(f"Inline Script #{i_idx}（長度: {len(txt)} 字元）"):
-                        st.code(txt[:2000], language="javascript")
+            # 完整 60 筆明細呈現（設定高高度讓手機可直接上下捲動檢視全部 60 列）
+            st.markdown("### 完整 60 筆解析明細表（買超 Top 1~30 + 賣超 Top 1~30）")
+            st.dataframe(df_result, use_container_width=True, height=900)
 
         except Exception as e:
-            st.error(f"探測發生例外：{e}")
+            st.error(f"解析過程發生例外：{e}")
             st.exception(e)

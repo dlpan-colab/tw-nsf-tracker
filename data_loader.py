@@ -1,22 +1,18 @@
 """
 模組名稱：data_loader.py
-版本識別：20261112_2233
+版本識別：20261112_2252
 修改目的：
-1. 更新版本識別為台灣時間 20261112_2233。
-2. 全面替換 HiStock 八大官股解析引擎：依據實測確認之 <ul class="stock-list"><li><span> DOM 結構，
-   精準解析買超 Top 30 與賣超 Top 30（共 60 檔個股、含「全部官股合計」與八大公股行庫明細，單位：萬元），
-   並支援傳入 target_date（?d=YYYY-MM-DD）抓取指定交易日資料。
-3. 新增個股分點區間買賣超（MoneyDJ zco.djhtm）與單一分點逐日明細（zco0.djhtm，精準計算買進-賣出）抓取函式，
-   支援第三階段「買賣超前五名個股下拉選單及指定期間各分點柱狀圖」顯示需求。
-4. 維持原有 EMPTY_TRADE_COLUMNS 欄位架構與 cloud_sync Google Drive 雙向落地同步機制。
+1. 更新版本識別為台灣時間 20261112_2252。
+2. 新增 get_missing_gov_trade_dates() 增量差集比對函式：比對指定期間台股實際交易日（valid_trade_dates）與資料庫已存檔日期，
+   僅回傳尚缺漏的交易日清單，避免重複抓取已存在資料。
+3. 新增 batch_sync_gov_records() 批次合併落地函式：支援多日增量補抓結果一次性去重合併寫入 CSV 並同步至 Google Drive，
+   大幅降低雲端上傳次數與執行耗時。
 防呆防錯原因：
-1. HiStock 僅提供金額（萬元）無張數，故「買進張數/賣出張數/買賣超張數」在 HiStock 來源中保持 0（不以金額除以 10 偽造假張數），
-   真實統計與排序統一依據真實「金額(萬元)」欄位執行。
-2. 從 <li title="YYYY-MM-DD ..."> 與 onclick='goUrl("代號")' 精準提取西元年月日與股票代號，杜絕跨年日期與代號誤判。
-3. 分點逐日明細強制以「買進 - 賣出」計算淨買賣超並執行區間日期過濾，防止誤抓總成交量或混入區間外日期。
+1. 排除「今日尚未盤後結算（台灣時間 17:00 前）」之當日日期於缺漏補抓之外，避免對尚未出爐的當日盤後表做無效請求。
+2. 保留 HiStock 真實金額（萬元）解析與 MoneyDJ 區間／逐日分點明細（買進-賣出）計算邏輯。
 """
 
-MODULE_VERSION = "20261112_2233"
+MODULE_VERSION = "20261112_2252"
 
 import os
 import re
@@ -36,9 +32,14 @@ import cloud_sync
 TW_TZ = ZoneInfo("Asia/Taipei")
 
 
+def get_tw_now() -> datetime.datetime:
+    """取得台灣時區當前完整時間"""
+    return datetime.datetime.now(TW_TZ)
+
+
 def get_tw_today() -> datetime.date:
     """取得台灣時區當前日期"""
-    return datetime.datetime.now(TW_TZ).date()
+    return get_tw_now().date()
 
 
 CACHE_DIR = "cache_data"
@@ -193,13 +194,10 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
     if target_date:
         url = f"{url}?d={target_date}"
 
-    print("\n" + "=" * 60, flush=True)
-    print(f"[DEBUG_HISTOCK] 連線請求: {url}", flush=True)
     debug_tables_info = []
 
     try:
         resp = requests.get(url, headers=REQ_HEADERS, timeout=15)
-        print(f"[DEBUG_HISTOCK] HTTP 狀態: {resp.status_code}, 內容總字元: {len(resp.text)}", flush=True)
         if resp.status_code != 200 or not resp.text:
             return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"連線異常 HTTP {resp.status_code}", []
 
@@ -221,24 +219,19 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
 
         records = []
         detected_dates = set()
-        categories = ["買超", "賣超"]
 
-        for idx, ul in enumerate(stock_lists[:2]):
-            cat_label = categories[idx]
+        for ul in stock_lists[:2]:
             li_items = ul.find_all("li", recursive=False)
             for li in li_items:
-                # 1. 從 title 屬性擷取完整交易日期（例如：2026-11-11）
                 title_attr = li.get("title", "")
                 date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title_attr)
                 row_date = date_match.group(1) if date_match else (target_date or get_tw_today().strftime("%Y-%m-%d"))
                 detected_dates.add(row_date)
 
-                # 2. 從 onclick='goUrl("2308");' 擷取股票代號
                 onclick_attr = li.get("onclick", "")
                 code_match = re.search(r'goUrl\(["\']([^"\']+)["\']\)', onclick_attr)
                 stock_code = code_match.group(1).strip() if code_match else ""
 
-                # 3. 取得直接子層 <span>（共 11 欄：名次、股票名、8大行庫、合計(萬)）
                 spans = li.find_all("span", recursive=False)
                 if len(spans) < 11 or not stock_code:
                     continue
@@ -247,7 +240,6 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
                 bank_amts = [_clean_num(spans[i].get_text(strip=True)) for i in range(2, 10)]
                 tot_amt = _clean_num(spans[10].get_text(strip=True))
 
-                # 寫入「全部官股合計」（HiStock 僅提供金額萬元，不偽造張數）
                 records.append({
                     "交易日期": row_date,
                     "官股分點": "全部官股合計",
@@ -259,7 +251,6 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
                     "金額(萬元)": round(tot_amt, 2)
                 })
 
-                # 寫入八大公股行庫各自買賣超金額（萬元）
                 for b_idx, (_, bank_std_name) in enumerate(HISTOCK_BRANCH_ORDER):
                     b_amt = bank_amts[b_idx]
                     if b_amt != 0:
@@ -275,8 +266,6 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
                         })
 
         actual_trade_date = sorted(detected_dates)[-1] if detected_dates else (target_date or get_tw_today().strftime("%Y-%m-%d"))
-        print(f"[DEBUG_HISTOCK] 辨識交易日: {actual_trade_date}, 總解析筆數: {len(records)}", flush=True)
-        print("=" * 60 + "\n", flush=True)
 
         if records:
             res_df = pd.DataFrame(records).drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
@@ -293,7 +282,6 @@ def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFra
     except Exception as e:
         print(f"[DEBUG_HISTOCK] 解析拋出例外: {e}", flush=True)
         traceback.print_exc()
-        print("=" * 60 + "\n", flush=True)
         return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"解析例外: {str(e)}", debug_tables_info
 
 
@@ -301,25 +289,68 @@ def sync_df_to_storage(df: pd.DataFrame) -> bool:
     """持久化保存至本地 CSV 與 Google Drive"""
     if df.empty:
         return False
+    return batch_sync_gov_records([df])
+
+
+def batch_sync_gov_records(df_list: list[pd.DataFrame]) -> bool:
+    """增量批次合併多日 DataFrame 並一次性寫入本地 CSV 與 Google Drive"""
+    valid_dfs = [d for d in df_list if d is not None and not d.empty]
+    if not valid_dfs:
+        return False
     try:
+        if not os.path.exists(LOCAL_GOV_FILE):
+            cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
+
+        new_batch = pd.concat(valid_dfs, ignore_index=True)
+        new_batch["代號"] = new_batch["代號"].astype(str)
+
         if os.path.exists(LOCAL_GOV_FILE):
             existing_df = pd.read_csv(LOCAL_GOV_FILE, dtype={"代號": str})
             if "買賣超金額(萬元)" in existing_df.columns and "金額(萬元)" not in existing_df.columns:
                 existing_df = existing_df.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-            df_copy = df.copy()
-            df_copy["代號"] = df_copy["代號"].astype(str)
-            combined = pd.concat([existing_df, df_copy], ignore_index=True)
-            combined = combined.drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
+            combined = pd.concat([existing_df, new_batch], ignore_index=True)
         else:
-            combined = df.copy()
-            combined["代號"] = combined["代號"].astype(str)
+            combined = new_batch
+
+        combined = combined.drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
+        combined = combined.sort_values(["交易日期", "代號", "官股分點"]).reset_index(drop=True)
         combined.to_csv(LOCAL_GOV_FILE, index=False)
         cloud_sync.upload_file_to_drive(LOCAL_GOV_FILE, "gov_trades_history.csv")
         clear_gov_cache()
         return True
     except Exception as e:
-        print(f"[data_loader] 歷史官股落地同步失敗: {e}", flush=True)
+        print(f"[data_loader] 批次歷史官股落地同步失敗: {e}", flush=True)
         return False
+
+
+def get_missing_gov_trade_dates(start_date: str, end_date: str, valid_trade_dates: list[str]) -> tuple[list[str], list[str]]:
+    """
+    增量差集比對：計算指定期間內的台股實際交易日（valid_trade_dates）中，
+    哪些日期尚未存在於本機／雲端資料庫。
+    回傳: (期間內全部應有交易日清單, 尚缺漏交易日清單)
+    """
+    if not os.path.exists(LOCAL_GOV_FILE):
+        cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
+
+    existing_dates = set()
+    if os.path.exists(LOCAL_GOV_FILE):
+        try:
+            cached_db = pd.read_csv(LOCAL_GOV_FILE, usecols=["交易日期"])
+            existing_dates = set(cached_db["交易日期"].dropna().astype(str).unique())
+        except Exception:
+            existing_dates = set()
+
+    now_tw = get_tw_now()
+    today_str = now_tw.strftime("%Y-%m-%d")
+    # 盤後 17:00 前不將「今日」納入強制缺漏補抓（HiStock 尚未結算）
+    cutoff_date = today_str if now_tw.hour >= 17 else (now_tw.date() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    target_trade_days = sorted([
+        d for d in set(valid_trade_dates)
+        if start_date <= d <= end_date and d <= cutoff_date
+    ])
+    missing_days = [d for d in target_trade_days if d not in existing_dates]
+    return target_trade_days, missing_days
 
 
 def get_latest_available_gov_date() -> datetime.date:

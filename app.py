@@ -1,117 +1,160 @@
 """
-模組名稱：app.py（獨立探測測試版 - 僅供驗證 HiStock 資料端點與結構，不寫入資料庫）
-版本識別：20261112_1517_TEST
+模組名稱：app.py（方向二：多資料源八大官股買賣超探測測試版 - 不寫入資料庫）
+版本識別：20261112_1529_DIR2_TEST
 修改目的：
-1. 獨立執行 HiStock (https://histock.tw/stock/broker8.aspx) 原始碼深度探測，不執行任何資料庫讀寫與雲端同步。
-2. 直接於前台手機介面分段列印所有包含 ajax、post、json、broker 或個股陣列之完整 <script> 原文。
-3. 列出所有包含資料之 table、tr、hidden input 及外部引用的自訂 .js 檔名，精準鎖定真實資料接口。
+1. 針對台股八大官股買賣超公開財經網站進行多源平行探測（不執行任何本地或雲端資料庫寫入）。
+2. 測試對象涵蓋：
+   - 來源 A：玩股網 WantGoo（八大官股買賣超排行與 JSON API 端點）
+   - 來源 B：Stock-AI / 股狗網 / 公開券商分點統計頁面
+   - 來源 C：Yahoo 奇摩股市（八大官股買賣超排行）
+   - 來源 D：HiStock 帶日期參數與特定 User-Agent/Cookie 標頭測試（比對是否為參數缺失）
+3. 直接於手機前台呈現各來源的 HTTP 狀態、表格欄位與前 5 筆真實解析數據，供肉眼核對正確性。
 防呆防錯原因：
-1. 完全隔離主系統模組，避免測試過程污染本地或雲端 CSV 資料庫。
-2. 採用可折疊區塊（st.expander）呈現大量原始碼，確保手機瀏覽器不卡頓且方便複製查閱。
+1. 各來源獨立 try-except 隔離，單一網站阻擋或逾時不影響其他來源測試結果。
+2. 表格預覽限制顯示前 5 列，確保手機畫面清晰易讀。
 """
 
 import re
+import json
 import datetime
+from io import StringIO
 from zoneinfo import ZoneInfo
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 
 TW_TZ = ZoneInfo("Asia/Taipei")
-TEST_VERSION = "20261112_1517_TEST"
+TEST_VERSION = "20261112_1529_DIR2_TEST"
 
-st.set_page_config(page_title="HiStock 資料端點探測器", layout="wide")
-st.caption(f"獨立探測版本（台灣時間）：{TEST_VERSION}")
-st.subheader("🔍 HiStock 八大官股真實資料源探測（手機驗證模式）")
+st.set_page_config(page_title="八大官股多資料源驗證器", layout="wide")
+st.caption(f"方向二測試版本（台灣時間）：{TEST_VERSION}")
+st.subheader("🧪 八大官股買賣超：多資料源與解析正確性驗證")
+st.info("本程式僅執行即時連線與解析驗證，不會寫入或更動任何資料庫檔案。")
 
-target_url = st.text_input("目標網址", value="https://histock.tw/stock/broker8.aspx")
-
-REQ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14; SM-S9380) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://histock.tw/"
 }
 
-if st.button("🚀 執行深度探測（不寫入資料庫）", type="primary", use_container_width=True):
-    with st.spinner("正在連線並剖析 HiStock 原始碼..."):
+DESKTOP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+def inspect_html_tables(html_text: str, source_name: str):
+    """通用 HTML 表格與關鍵文字探測器"""
+    soup = BeautifulSoup(html_text, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else "無標題"
+    st.write(f"**網頁標題：** `{title}`")
+
+    try:
+        dfs = pd.read_html(StringIO(html_text))
+        st.write(f"**`pd.read_html` 偵測表格數：** `{len(dfs)}` 張")
+        valid_count = 0
+        for idx, df in enumerate(dfs):
+            if df.shape[0] >= 3 and df.shape[1] >= 4:
+                valid_count += 1
+                st.success(f"表格 #{idx} 具備有效資料列（形狀: {df.shape}）")
+                st.dataframe(df.head(5), use_container_width=True)
+        if valid_count == 0:
+            st.warning("所有靜態 `<table>` 皆無有效個股資料列（列數 < 3）。")
+    except ValueError:
+        st.warning("頁面中無標準 HTML `<table>` 標籤。")
+    except Exception as e:
+        st.error(f"表格解析異常：{e}")
+
+if st.button("🚀 開始平行驗證所有候選資料源", type="primary", use_container_width=True):
+
+    # ---------------------------------------------------------
+    # 來源 1：玩股網 WantGoo（八大官股買賣超排行頁面與內部 API）
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 1：玩股網 WantGoo（八大官股進出排行）")
+    wantgoo_urls = [
+        ("WantGoo 官股主頁", "https://www.wantgoo.com/stock/public-bank/buy-sell"),
+        ("WantGoo 官股 JSON API 探測", "https://www.wantgoo.com/stock/public-bank/buy-sell-data"),
+    ]
+    for label, url in wantgoo_urls:
+        with st.expander(f"測試：{label} (`{url}`)", expanded=True):
+            try:
+                headers = DESKTOP_HEADERS.copy()
+                headers["Referer"] = "https://www.wantgoo.com/stock/public-bank/buy-sell"
+                resp = requests.get(url, headers=headers, timeout=12)
+                st.write(f"HTTP 狀態：**{resp.status_code}** ｜ 回傳長度：**{len(resp.text):,}** 字元")
+                if resp.status_code == 200:
+                    if "application/json" in resp.headers.get("Content-Type", "") or resp.text.strip().startswith(("{", "[")):
+                        st.success("回傳為 JSON 格式！前 800 字元預覽：")
+                        st.code(resp.text[:800], language="json")
+                    else:
+                        inspect_html_tables(resp.text, label)
+                        # 檢查是否有內嵌 JSON
+                        json_hits = re.findall(r"(?:var|const|let)\s+\w+\s*=\s*(\[\{.*?\}\]);", resp.text)
+                        if json_hits:
+                            st.info(f"發現內嵌 JSON 陣列（共 {len(json_hits)} 組），第一組預覽：")
+                            st.code(json_hits[0][:500], language="json")
+            except Exception as e:
+                st.error(f"連線失敗：{e}")
+
+    # ---------------------------------------------------------
+    # 來源 2：Yahoo 奇摩股市（八大官股買賣超排行）
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 2：Yahoo 奇摩股市（八大官股買賣超）")
+    yahoo_urls = [
+        ("Yahoo 股市官股買超", "https://tw.stock.yahoo.com/rank/government-bank-buy"),
+        ("Yahoo 股市官股賣超", "https://tw.stock.yahoo.com/rank/government-bank-sell"),
+    ]
+    for label, url in yahoo_urls:
+        with st.expander(f"測試：{label} (`{url}`)", expanded=True):
+            try:
+                resp = requests.get(url, headers=DESKTOP_HEADERS, timeout=12)
+                st.write(f"HTTP 狀態：**{resp.status_code}** ｜ 回傳長度：**{len(resp.text):,}** 字元")
+                if resp.status_code == 200:
+                    inspect_html_tables(resp.text, label)
+                    # Yahoo 股市常使用 Next.js / App.main JSON 內嵌數據
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    rows = soup.select("li.List\\(n\\)")
+                    if rows:
+                        st.info(f"偵測到列表式排版（`li.List(n)`）共 {len(rows)} 列，前 3 列純文字預覽：")
+                        for r in rows[:3]:
+                            st.text(" | ".join(r.stripped_strings))
+            except Exception as e:
+                st.error(f"連線失敗：{e}")
+
+    # ---------------------------------------------------------
+    # 來源 3：鉅亨網 Anue / 財經 M 平方 / 股狗網公開排行
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 3：鉅亨網 / 公開財經站點（八大官股買賣超）")
+    other_urls = [
+        ("鉅亨網台股官股進出", "https://www.cnyes.com/twstock/a_official.aspx"),
+        ("StockQ / 富聯網八大官股", "https://www.money-link.com.tw/RealtimeNews/index.aspx"),
+    ]
+    for label, url in other_urls:
+        with st.expander(f"測試：{label} (`{url}`)", expanded=True):
+            try:
+                resp = requests.get(url, headers=DESKTOP_HEADERS, timeout=12)
+                resp.encoding = resp.apparent_encoding
+                st.write(f"HTTP 狀態：**{resp.status_code}** ｜ 回傳長度：**{len(resp.text):,}** 字元")
+                if resp.status_code == 200:
+                    inspect_html_tables(resp.text, label)
+            except Exception as e:
+                st.error(f"連線失敗：{e}")
+
+    # ---------------------------------------------------------
+    # 來源 4：HiStock 帶明確日期參數與 Desktop Cookie 驗證
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 來源 4：HiStock 帶日期參數（`?d=2026-11-11`）驗證")
+    with st.expander("測試：HiStock 指定交易日 URL", expanded=True):
         try:
-            resp = requests.get(target_url, headers=REQ_HEADERS, timeout=15)
-            st.success(f"HTTP 狀態碼：{resp.status_code} ｜ 原始碼總長度：{len(resp.text):,} 字元")
-
-            if resp.status_code != 200 or not resp.text:
-                st.error("無法取得有效網頁內容，請檢查狀態碼。")
-                st.stop()
-
-            html_text = resp.text
-            soup = BeautifulSoup(html_text, "html.parser")
-
-            # 1. 標題與日期確認
-            st.markdown("### 1. 頁面標題與交易日辨識")
-            title_str = soup.title.string.strip() if soup.title and soup.title.string else "無標題"
-            st.write(f"**網頁 Title：** `{title_str}`")
-            date_matches = re.findall(r"(\d{2,4}[-/]\d{2}(?:[-/]\d{2})?\s*Top\s*30[^\n<]*)", soup.get_text())
-            st.write(f"**頁面日期字樣匹配：** `{date_matches}`")
-
-            # 2. 外部引入的 JS 檔案（過濾掉常見廣告/統計，保留 histock 自家腳本）
-            st.markdown("### 2. 外部引用 JS 腳本清單")
-            ext_scripts = []
-            for s in soup.find_all("script", src=True):
-                src = s["src"]
-                if not any(ad in src.lower() for ad in ["google", "facebook", "doubleclick", "criteo", "analytics", "gtag"]):
-                    ext_scripts.append(src)
-            st.code("\n".join(ext_scripts) if ext_scripts else "無自訂外部 JS", language="text")
-
-            # 3. 關鍵內嵌 <script> 完整原始碼檢視
-            st.markdown("### 3. 關鍵內嵌 `<script>` 完整原始碼")
-            keywords = ["ajax", "post", "getjson", "fetch", "broker", "top", "合庫", "土銀", "台銀", "ashx", "asmx", "api", "bind", "grid"]
-            inline_scripts = [s for s in soup.find_all("script") if not s.get("src")]
-            st.write(f"共找到 **{len(inline_scripts)}** 個內嵌 `<script>` 區塊，以下列出包含資料請求或官股關鍵字的完整原文：")
-
-            matched_count = 0
-            for idx, s in enumerate(inline_scripts):
-                raw_js = (s.string or s.get_text() or "").strip()
-                if not raw_js:
-                    continue
-                lower_js = raw_js.lower()
-                hit_keys = [k for k in keywords if k in lower_js]
-                if hit_keys:
-                    matched_count += 1
-                    with st.expander(f"內嵌 Script #{idx}（長度: {len(raw_js)} 字元 ｜ 命中關鍵字: {', '.join(hit_keys)}）", expanded=(matched_count <= 2)):
-                        st.code(raw_js, language="javascript")
-
-            if matched_count == 0:
-                st.warning("未在內嵌 Script 中命中任何資料請求關鍵字。")
-
-            # 4. 隱藏表單欄位（ASP.NET ViewState / Hidden Inputs）
-            st.markdown("### 4. 頁面隱藏欄位（Hidden Inputs）")
-            hidden_inputs = []
-            for inp in soup.find_all("input", type="hidden"):
-                name = inp.get("name") or inp.get("id") or "未命名"
-                val = inp.get("value", "")
-                # 排除過長的 ViewState 雜訊，但標示其長度
-                if name in ["__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR"]:
-                    hidden_inputs.append({"name": name, "value_preview": f"[系統狀態碼，長度 {len(val)} 字元]"})
-                else:
-                    hidden_inputs.append({"name": name, "value": val})
-            st.json(hidden_inputs)
-
-            # 5. 所有 Table 與非空 TR 檢查
-            st.markdown("### 5. HTML `<table>` 與 `<tr>` 實體結構掃描")
-            tables = soup.find_all("table")
-            st.write(f"總計找到 **{len(tables)}** 個 `<table>` 標籤：")
-            for t_idx, tbl in enumerate(tables):
-                trs = tbl.find_all("tr")
-                with st.expander(f"Table #{t_idx}（id={tbl.get('id')}, class={tbl.get('class')}, 總列數={len(trs)}）"):
-                    for r_idx, tr in enumerate(trs[:5]):
-                        cells = [c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
-                        st.write(f"列 {r_idx}: `{cells}`")
-
-            # 6. 全文搜尋疑似 AJAX 端點路徑（.ashx / .asmx / .aspx/方法）
-            st.markdown("### 6. 全文正則萃取疑似後端端點（.ashx / .asmx / .aspx）")
-            endpoints = sorted(set(re.findall(r"['\"]([^'\"\s]+?\.(?:ashx|asmx|aspx(?:/[a-zA-Z0-9_]+)?)[^'\"\s]*)['\"]", html_text, re.IGNORECASE)))
-            st.code("\n".join(endpoints) if endpoints else "未匹配到明確後端端點路徑", language="text")
-
+            test_histock_url = "https://histock.tw/stock/broker8.aspx?d=2026-11-11"
+            resp = requests.get(test_histock_url, headers=DESKTOP_HEADERS, timeout=12)
+            st.write(f"HTTP 狀態：**{resp.status_code}** ｜ 回傳長度：**{len(resp.text):,}** 字元")
+            if resp.status_code == 200:
+                inspect_html_tables(resp.text, "HiStock 指定日期")
         except Exception as e:
-            st.error(f"探測過程發生例外：{e}")
-            st.exception(e)
+            st.error(f"連線失敗：{e}")

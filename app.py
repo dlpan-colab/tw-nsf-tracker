@@ -1,20 +1,19 @@
 """
-模組名稱：app.py（個股分點區間排行 + 前五大買賣超分點每日買賣超柱狀圖測試版）
-版本識別：20261112_1620_BROKER_DAILY_BAR
+模組名稱：app.py（個股分點區間排行 + 前五大買賣超分點每日買賣超柱狀圖修正版）
+版本識別：20261112_1628_BROKER_DAILY_BAR_FIX
 修改目的：
-1. 於富邦證券（MoneyDJ 引擎）個股區間分點表（zco.djhtm）解析買超前 15 名與賣超前 15 名分點。
-2. 自動擷取「買超前 5 名」與「賣超前 5 名」分點之明細超連結（zco0.djhtm），抓取該期間內各分點的逐日買賣超張數。
-3. 使用 Streamlit 內建 Altair 繪製各前五名分點之「每日買賣超柱狀圖」（紅柱為買超、綠柱為賣超），供手機前台視覺化檢視。
+1. 修正 zco0.djhtm 逐日明細欄位解析錯誤：原誤抓第 4 欄（總成交張數 = 買進 + 賣出），現改為精準計算「買進(張) - 賣出(張)」並核對第 5 欄買賣超張數，真實呈現每日買超（正值紅柱）與賣超（負值綠柱）。
+2. 加入日期區間過濾（start_date <= 日期 <= end_date）與動態區間參數帶入，排除 zco0.djhtm 預設回傳之區間外最新交易日（如 11/11），確保圖表橫軸與設定區間完全一致。
+3. 同時顯示「區間明細加總驗算」於圖表標題，供與主表區間累計張數即時核對。
 防呆防錯原因：
-1. 直接從主表 <a> 標籤提取分點專屬 href（含券商代碼 b 與參數 c），避免自行推測分點代碼導致查無資料。
-2. 相容處理民國年（如 115/10/07）與西元年日期格式，並強制依日期升冪排序，確保柱狀圖時間軸由左至右正確呈現。
-3. 每次子頁面請求間隔 0.3 秒並加上獨立 try-except 防護，防止短時間密集請求遭目標伺服器限流或單一分點異常中斷整體畫面。
+1. 避免欄位順序變動導致買賣超正負號反轉，直接以 `buy_vol - sell_vol` 作為核心買賣超計算基準。
+2. 於分點明細連結動態覆寫 `e`（起日）與 `f`（迄日）參數，並於本地 DataFrame 再執行一次日期區間篩選，雙重防止區間外數據混入。
 """
 
 import re
 import time
 import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
@@ -23,11 +22,11 @@ from bs4 import BeautifulSoup
 import streamlit as st
 
 TW_TZ = ZoneInfo("Asia/Taipei")
-TEST_VERSION = "20261112_1620_BROKER_DAILY_BAR"
+TEST_VERSION = "20261112_1628_BROKER_DAILY_BAR_FIX"
 BASE_DOMAIN = "https://fubon-ebrokerdj.fbs.com.tw"
 
 st.set_page_config(page_title="個股分點區間與每日柱狀圖", layout="wide")
-st.caption(f"測試版本（台灣時間）：{TEST_VERSION}")
+st.caption(f"修正版本（台灣時間）：{TEST_VERSION}")
 st.subheader("📊 個股區間分點排行與前五大買賣超分點每日柱狀圖")
 
 col_in1, col_in2, col_in3 = st.columns(3)
@@ -66,7 +65,18 @@ def normalize_tw_date(date_str: str) -> str:
     return f"{y:04d}-{mo:02d}-{d:02d}"
 
 
-def parse_range_ranking(html_text: str):
+def build_detail_url_with_range(raw_href: str, s_mdj: str, e_mdj: str) -> str:
+    """解析分點明細連結並強制帶入指定起迄日期參數 e 與 f"""
+    full_url = urljoin(BASE_DOMAIN, raw_href)
+    parsed = urlparse(full_url)
+    qs = parse_qs(parsed.query)
+    qs["e"] = [s_mdj]
+    qs["f"] = [e_mdj]
+    new_query = urlencode(qs, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+
+def parse_range_ranking(html_text: str, s_mdj: str, e_mdj: str):
     """解析區間買賣超分點主表，回傳含明細連結的買超清單與賣超清單"""
     soup = BeautifulSoup(html_text, "html.parser")
     buy_list = []
@@ -86,7 +96,7 @@ def parse_range_ranking(html_text: str):
                 # 左側：買超分點
                 if left_txt[0] and left_txt[0] not in ("買超券商", "券商名稱", "分點") and any(c.isdigit() for c in left_txt[-1]):
                     a_tag = left_cells[0].find("a", href=True)
-                    detail_url = urljoin(BASE_DOMAIN, a_tag["href"]) if a_tag else ""
+                    detail_url = build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
                     buy_list.append({
                         "分點名稱": left_txt[0],
                         "買進(張)": clean_int(left_txt[1]),
@@ -99,7 +109,7 @@ def parse_range_ranking(html_text: str):
                 # 右側：賣超分點
                 if right_txt[0] and right_txt[0] not in ("賣超券商", "券商名稱", "分點") and any(c.isdigit() for c in right_txt[-1]):
                     a_tag = right_cells[0].find("a", href=True)
-                    detail_url = urljoin(BASE_DOMAIN, a_tag["href"]) if a_tag else ""
+                    detail_url = build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
                     sell_list.append({
                         "分點名稱": right_txt[0],
                         "買進(張)": clean_int(right_txt[1]),
@@ -112,8 +122,8 @@ def parse_range_ranking(html_text: str):
     return pd.DataFrame(buy_list), pd.DataFrame(sell_list)
 
 
-def fetch_broker_daily_series(detail_url: str) -> pd.DataFrame:
-    """抓取單一分點在指定區間內的逐日買賣超明細 (zco0.djhtm)"""
+def fetch_broker_daily_series(detail_url: str, s_iso: str, e_iso: str) -> pd.DataFrame:
+    """抓取單一分點逐日明細 (zco0.djhtm)，精準計算買賣超(買進-賣出)並過濾指定日期區間"""
     if not detail_url:
         return pd.DataFrame()
     resp = requests.get(detail_url, headers=REQ_HEADERS, timeout=15)
@@ -126,13 +136,22 @@ def fetch_broker_daily_series(detail_url: str) -> pd.DataFrame:
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-            # zco0.djhtm 標準逐日明細列為 4 或 5 欄：[日期, 買進, 賣出, 買賣超, (佔比)]
-            if len(tds) in (4, 5) and re.match(r"^\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2}$", tds[0]):
-                net_vol = clean_int(tds[3])
+            # zco0.djhtm 逐日明細列結構：[日期, 買進, 賣出, 成交張數(買+賣), 買賣超(買-賣)]
+            if len(tds) >= 4 and re.match(r"^\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2}$", tds[0]):
+                norm_date = normalize_tw_date(tds[0])
+                # 防呆過濾：僅保留使用者指定區間內的交易日
+                if not (s_iso <= norm_date <= e_iso):
+                    continue
+
+                buy_vol = clean_int(tds[1])
+                sell_vol = clean_int(tds[2])
+                # 直接以 買進 - 賣出 計算真實淨買賣超（避免誤抓第 4 欄總成交量）
+                net_vol = buy_vol - sell_vol
+
                 daily_rows.append({
-                    "日期": normalize_tw_date(tds[0]),
-                    "買進(張)": clean_int(tds[1]),
-                    "賣出(張)": clean_int(tds[2]),
+                    "日期": norm_date,
+                    "買進(張)": buy_vol,
+                    "賣出(張)": sell_vol,
                     "買賣超(張)": net_vol,
                     "方向": "買超" if net_vol >= 0 else "賣超"
                 })
@@ -145,8 +164,8 @@ def fetch_broker_daily_series(detail_url: str) -> pd.DataFrame:
 
 
 def render_daily_bar_chart(df_daily: pd.DataFrame, title_text: str):
-    """使用 Altair 繪製紅買綠賣每日買賣超柱狀圖"""
-    chart = (
+    """使用 Altair 繪製紅買綠賣每日買賣超柱狀圖（含零軸參考線）"""
+    bars = (
         alt.Chart(df_daily)
         .mark_bar(size=14)
         .encode(
@@ -154,17 +173,20 @@ def render_daily_bar_chart(df_daily: pd.DataFrame, title_text: str):
             y=alt.Y("買賣超(張):Q", title="買賣超 (張)"),
             color=alt.condition(
                 alt.datum["買賣超(張)"] >= 0,
-                alt.value("#ef5350"),  # 台股習慣：紅買
-                alt.value("#26a69a")   # 台股習慣：綠賣
+                alt.value("#ef5350"),  # 紅柱：當日買超
+                alt.value("#26a69a")   # 綠柱：當日賣超
             ),
             tooltip=["日期", "買進(張)", "賣出(張)", "買賣超(張)"]
         )
-        .properties(title=title_text, height=240)
     )
+    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888888", strokeDash=[3, 3]).encode(y="y:Q")
+    chart = (bars + zero_rule).properties(title=title_text, height=250)
     st.altair_chart(chart, use_container_width=True)
 
 
 if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", type="primary", use_container_width=True):
+    s_iso = start_date.strftime("%Y-%m-%d")
+    e_iso = end_date.strftime("%Y-%m-%d")
     s_mdj = f"{start_date.year}-{start_date.month}-{start_date.day}"
     e_mdj = f"{end_date.year}-{end_date.month}-{end_date.day}"
     main_url = f"{BASE_DOMAIN}/z/zc/zco/zco.djhtm?a={stock_id}&e={s_mdj}&f={e_mdj}"
@@ -177,7 +199,7 @@ if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", t
                 st.error(f"主表連線失敗，HTTP 狀態碼：{resp.status_code}")
                 st.stop()
 
-            df_buy, df_sell = parse_range_ranking(resp.text)
+            df_buy, df_sell = parse_range_ranking(resp.text, s_mdj, e_mdj)
             if df_buy.empty and df_sell.empty:
                 st.error("未解析到任何分點數據，請確認股票代碼與日期區間。")
                 st.stop()
@@ -186,7 +208,7 @@ if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", t
             # 1. 表列買賣超前 15 名分點
             # ---------------------------------------------------------
             st.markdown("---")
-            st.markdown(f"### 1. `{stock_id}` 區間買賣超前 15 名分點總表（{s_mdj} ~ {e_mdj}）")
+            st.markdown(f"### 1. `{stock_id}` 區間買賣超前 15 名分點總表（{s_iso} ~ {e_iso}）")
             col_t1, col_t2 = st.columns(2)
             with col_t1:
                 st.write("**🔴 買超分點 Top 15**")
@@ -206,11 +228,15 @@ if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", t
                 b_net = row["買賣超(張)"]
                 d_url = row["明細網址"]
                 with st.spinner(f"載入買超第 {idx + 1} 名【{b_name}】逐日明細..."):
-                    df_d = fetch_broker_daily_series(d_url)
+                    df_d = fetch_broker_daily_series(d_url, s_iso, e_iso)
                     if not df_d.empty:
-                        render_daily_bar_chart(df_d, f"買超 Top {idx + 1}：{b_name}（區間累計：{b_net:+,} 張）")
+                        sub_sum = int(df_d["買賣超(張)"].sum())
+                        render_daily_bar_chart(
+                            df_d,
+                            f"買超 Top {idx + 1}：{b_name}（主表累計：{b_net:+,} 張 ｜ 逐日加總：{sub_sum:+,} 張）"
+                        )
                     else:
-                        st.warning(f"【{b_name}】無法取得逐日明細（連結：{d_url}）")
+                        st.warning(f"【{b_name}】在 {s_iso}~{e_iso} 無逐日明細資料。")
                     time.sleep(0.3)
 
             # ---------------------------------------------------------
@@ -224,11 +250,15 @@ if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", t
                 s_net = row["買賣超(張)"]
                 d_url = row["明細網址"]
                 with st.spinner(f"載入賣超第 {idx + 1} 名【{s_name}】逐日明細..."):
-                    df_d = fetch_broker_daily_series(d_url)
+                    df_d = fetch_broker_daily_series(d_url, s_iso, e_iso)
                     if not df_d.empty:
-                        render_daily_bar_chart(df_d, f"賣超 Top {idx + 1}：{s_name}（區間累計：{s_net:,} 張）")
+                        sub_sum = int(df_d["買賣超(張)"].sum())
+                        render_daily_bar_chart(
+                            df_d,
+                            f"賣超 Top {idx + 1}：{s_name}（主表累計：{s_net:,} 張 ｜ 逐日加總：{sub_sum:+,} 張）"
+                        )
                     else:
-                        st.warning(f"【{s_name}】無法取得逐日明細（連結：{d_url}）")
+                        st.warning(f"【{s_name}】在 {s_iso}~{e_iso} 無逐日明細資料。")
                     time.sleep(0.3)
 
         except Exception as e:

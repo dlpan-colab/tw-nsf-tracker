@@ -1,16 +1,22 @@
 """
 模組名稱：data_loader.py
-版本識別：20261112_0012
+版本識別：20261112_2233
 修改目的：
-1. 更新版本識別為台灣時間 20261112_0012。
-2. 針對靜態 HTML 僅有 2 個 <tr> 的特性，加入正則全文字掃描（搜尋 JavaScript 內嵌變數與字串）。
-3. 將抓取到的關鍵字上下文摘要注入 debug_tables_info，供前台 expander 檢視真實內嵌結構。
-4. 維持 print flush=True 與金額萬元、張數整數規範。
+1. 更新版本識別為台灣時間 20261112_2233。
+2. 全面替換 HiStock 八大官股解析引擎：依據實測確認之 <ul class="stock-list"><li><span> DOM 結構，
+   精準解析買超 Top 30 與賣超 Top 30（共 60 檔個股、含「全部官股合計」與八大公股行庫明細，單位：萬元），
+   並支援傳入 target_date（?d=YYYY-MM-DD）抓取指定交易日資料。
+3. 新增個股分點區間買賣超（MoneyDJ zco.djhtm）與單一分點逐日明細（zco0.djhtm，精準計算買進-賣出）抓取函式，
+   支援第三階段「買賣超前五名個股下拉選單及指定期間各分點柱狀圖」顯示需求。
+4. 維持原有 EMPTY_TRADE_COLUMNS 欄位架構與 cloud_sync Google Drive 雙向落地同步機制。
 防呆防錯原因：
-1. 避免 read_html 與 DOM 標籤解析失敗時完全無資料，透過純文字比對保障動態資料萃取。
+1. HiStock 僅提供金額（萬元）無張數，故「買進張數/賣出張數/買賣超張數」在 HiStock 來源中保持 0（不以金額除以 10 偽造假張數），
+   真實統計與排序統一依據真實「金額(萬元)」欄位執行。
+2. 從 <li title="YYYY-MM-DD ..."> 與 onclick='goUrl("代號")' 精準提取西元年月日與股票代號，杜絕跨年日期與代號誤判。
+3. 分點逐日明細強制以「買進 - 賣出」計算淨買賣超並執行區間日期過濾，防止誤抓總成交量或混入區間外日期。
 """
 
-MODULE_VERSION = "20261112_0012"
+MODULE_VERSION = "20261112_2233"
 
 import os
 import re
@@ -18,7 +24,7 @@ import json
 import time
 import datetime
 import traceback
-from io import StringIO
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 from zoneinfo import ZoneInfo
 import requests
 import pandas as pd
@@ -29,38 +35,63 @@ import cloud_sync
 
 TW_TZ = ZoneInfo("Asia/Taipei")
 
+
 def get_tw_today() -> datetime.date:
     """取得台灣時區當前日期"""
     return datetime.datetime.now(TW_TZ).date()
+
 
 CACHE_DIR = "cache_data"
 os.makedirs(CACHE_DIR, exist_ok=True)
 LOCAL_TAIEX_FILE = os.path.join(CACHE_DIR, "taiex_history.csv")
 LOCAL_GOV_FILE = os.path.join(CACHE_DIR, "gov_trades_history.csv")
 
-HISTOCK_BRANCH_COLS = {
-    "合庫": "合作金庫",
-    "土銀": "台灣土地銀行",
-    "台銀": "臺灣銀行",
-    "台企銀": "臺灣中小企銀",
-    "第一金": "第一金證券",
-    "兆豐": "兆豐證券",
-    "華南": "華南永昌",
-    "彰銀": "彰化銀行"
-}
-GOV_BANKS = list(HISTOCK_BRANCH_COLS.values())
+# HiStock 網頁欄位順序對應至標準官股分點名稱
+HISTOCK_BRANCH_ORDER = [
+    ("合庫", "合作金庫"),
+    ("土銀", "台灣土地銀行"),
+    ("台銀", "臺灣銀行"),
+    ("台企銀", "臺灣中小企銀"),
+    ("彰銀", "彰化銀行"),
+    ("第一金", "第一金證券"),
+    ("兆豐銀", "兆豐證券"),
+    ("華南永昌", "華南永昌"),
+]
+
+GOV_BANKS = [label for _, label in HISTOCK_BRANCH_ORDER]
+
+# 八大官股券商分點名稱前綴（用於過濾 MoneyDJ 全市場分點明細中的各地官股分點）
+GOV_BROKER_PREFIXES = (
+    "合庫", "合作金庫",
+    "土銀", "土地銀行",
+    "台銀", "臺銀", "台灣銀行", "臺灣銀行",
+    "台企", "臺企", "台灣企銀", "臺灣企銀",
+    "彰銀", "彰化銀行",
+    "第一金",
+    "兆豐",
+    "華南永昌"
+)
 
 EMPTY_TRADE_COLUMNS = [
-    "交易日期", "官股分點", "代號", "名稱", 
+    "交易日期", "官股分點", "代號", "名稱",
     "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"
 ]
 
 REQ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://histock.tw/"
 }
+
+MDJ_BASE_DOMAIN = "https://fubon-ebrokerdj.fbs.com.tw"
+MDJ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": f"{MDJ_BASE_DOMAIN}/"
+}
+
 
 def purge_gov_database() -> bool:
     """手動專用：清空本機與 Google Drive 上的官股歷史資料庫"""
@@ -74,10 +105,12 @@ def purge_gov_database() -> bool:
         print(f"[data_loader] 清空歷史資料庫失敗: {e}", flush=True)
         return False
 
+
 def clear_gov_cache():
     """清除 Streamlit 記憶體快取"""
     fetch_range_gov_branch_summary.clear()
     fetch_gov_branch_trades.clear()
+
 
 @st.cache_data(ttl=3600)
 def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
@@ -96,11 +129,11 @@ def load_policy_events(filepath: str = "policy_events.json") -> pd.DataFrame:
         st.error(f"讀取政策事件紀錄檔失敗: {e}")
         return pd.DataFrame(columns=["Date", "type", "name", "marker", "color", "description"])
 
+
 @st.cache_data(ttl=900)
 def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
     if not os.path.exists(LOCAL_TAIEX_FILE):
         cloud_sync.download_file_from_drive("taiex_history.csv", LOCAL_TAIEX_FILE)
-    
     local_df = pd.DataFrame()
     if os.path.exists(LOCAL_TAIEX_FILE):
         try:
@@ -109,10 +142,8 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
                 local_df["Date"] = pd.to_datetime(local_df["Date"]).dt.strftime("%Y-%m-%d")
         except Exception:
             local_df = pd.DataFrame()
-            
     end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
     end_str = end_dt.strftime("%Y-%m-%d")
-    
     try:
         df = yf.download("^TWII", start=start_date, end=end_str, progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -134,143 +165,130 @@ def fetch_taiex_data(start_date: str, end_date: str) -> pd.DataFrame:
             return df
     except Exception as e:
         st.warning(f"加權指數線上抓取異常，嘗試使用快取: {e}")
-        
     if not local_df.empty:
         return local_df
     return pd.DataFrame()
 
+
 def _clean_num(val) -> float:
+    """移除千分位逗號與空白並轉為浮點數"""
     if val is None or pd.isna(val):
         return 0.0
-    clean = re.sub(r"[^\d\.\-\+]", "", str(val).replace(",", ""))
+    clean = re.sub(r"[^\d\.\-\+]", "", str(val).replace(",", "").replace("\xa0", ""))
+    if clean in ("", "-", "+", "--", "—"):
+        return 0.0
     try:
-        return float(clean) if clean else 0.0
+        return float(clean)
     except Exception:
         return 0.0
 
-def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str, list]:
+
+def fetch_histock_latest_gov_trades(target_date: str = None) -> tuple[pd.DataFrame, str, str, list]:
     """
-    自 HiStock 抓取最新八大官股結算日報
-    支援正則純文字掃描與 JavaScript 動態結構萃取
+    自 HiStock 抓取八大官股結算日報（買超 Top 30 + 賣超 Top 30，單位：萬元）
+    - target_date: 可選參數（格式 'YYYY-MM-DD'），若不傳則抓取 HiStock 最新一個交易日
     回傳: (DataFrame, 實際交易日期, 狀態說明, 結構診斷列表)
     """
     url = "https://histock.tw/stock/broker8.aspx"
+    if target_date:
+        url = f"{url}?d={target_date}"
+
     print("\n" + "=" * 60, flush=True)
     print(f"[DEBUG_HISTOCK] 連線請求: {url}", flush=True)
     debug_tables_info = []
-    
+
     try:
-        resp = requests.get(url, headers=REQ_HEADERS, timeout=12)
+        resp = requests.get(url, headers=REQ_HEADERS, timeout=15)
         print(f"[DEBUG_HISTOCK] HTTP 狀態: {resp.status_code}, 內容總字元: {len(resp.text)}", flush=True)
         if resp.status_code != 200 or not resp.text:
             return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"連線異常 HTTP {resp.status_code}", []
 
-        # 1. 萃取日期
         soup = BeautifulSoup(resp.text, "html.parser")
-        page_text = soup.get_text()
-        date_match = re.search(r"(\d{2})[-/](\d{2})\s+Top\s+30\s+八大", page_text)
-        current_year = get_tw_today().year
-        if date_match:
-            mm, dd = date_match.group(1), date_match.group(2)
-            actual_trade_date = f"{current_year}-{mm}-{dd}"
-            print(f"[DEBUG_HISTOCK] 辨識發布交易日: {actual_trade_date}", flush=True)
-        else:
-            actual_trade_date = get_tw_today().strftime("%Y-%m-%d")
-            print(f"[DEBUG_HISTOCK] 未能透過正規表達式提取標題日期，預設台灣日期: {actual_trade_date}", flush=True)
-
-        records = []
-
-        # 2. 檢測靜態表格表頭
-        dfs = pd.read_html(StringIO(resp.text))
-        print(f"[DEBUG_HISTOCK] pd.read_html 找到 {len(dfs)} 張表格", flush=True)
-        for idx, df in enumerate(dfs):
-            debug_tables_info.append({
-                "來源": f"read_html 表格 #{idx}",
-                "shape": df.shape,
-                "columns": list(df.columns)
-            })
-
-        # 3. 純文字正則萃取：搜尋內嵌在 script 中的 JSON 陣列或資料字串
-        html_content = resp.text
-        script_tags = soup.find_all("script")
-        print(f"[DEBUG_HISTOCK] 掃描到 {len(script_tags)} 個 <script> 標籤", flush=True)
-        
-        sample_snippets = []
-        for s_idx, s in enumerate(script_tags):
-            s_text = s.string or s.text or ""
-            if any(k in s_text for k in ["broker", "Top", "合庫", "土銀", "台銀"]):
-                # 擷取關鍵字前後 200 字元作為樣本
-                m = re.search(r"(broker|Top|合庫|土銀|台銀)", s_text)
-                if m:
-                    start_pos = max(0, m.start() - 50)
-                    end_pos = min(len(s_text), m.start() + 250)
-                    sample_snippets.append({
-                        "script_idx": s_idx,
-                        "長度": len(s_text),
-                        "內容片段": s_text[start_pos:end_pos].strip()
-                    })
-
+        stock_lists = soup.find_all("ul", class_="stock-list")
         debug_tables_info.append({
-            "來源": "內嵌 Script 關鍵字偵測",
-            "相關 Script 數量": len(sample_snippets),
-            "片段列表": sample_snippets[:3]
+            "來源": "HiStock ul.stock-list 結構檢測",
+            "目標網址": url,
+            "偵測區塊數": len(stock_lists)
         })
 
-        # 4. 尋找表格本體字串（例如在 div 或 hidden input 內的純文字數據）
-        # 尋找匹配：/stock/(\d{4,6}) 或 stockid=(\d{4,6})
-        stock_matches = list(re.finditer(r"/stock/(\d{4,6})['\"]?\s*>([^<]+)</a>", html_content))
-        print(f"[DEBUG_HISTOCK] 正則匹配到個股連結數: {len(stock_matches)}", flush=True)
+        if len(stock_lists) < 2:
+            return (
+                pd.DataFrame(columns=EMPTY_TRADE_COLUMNS),
+                target_date or "",
+                f"未偵測到買超/賣超清單區塊（找到 {len(stock_lists)} 組 ul.stock-list）",
+                debug_tables_info
+            )
 
-        branch_order = ["合庫", "土銀", "台銀", "台企銀", "彰銀", "第一金", "兆豐", "華南"]
+        records = []
+        detected_dates = set()
+        categories = ["買超", "賣超"]
 
-        for sm in stock_matches:
-            stock_code = sm.group(1)
-            stock_name = sm.group(2).strip()
-            # 取得該股票標籤後方 600 字元內的數字
-            after_html = html_content[sm.end():sm.end() + 600]
-            # 抓取所有數字（包含小數與正負號）
-            numbers = re.findall(r"[-+]?\d[\d,]*\.?\d*", after_html)
-            clean_nums = [_clean_num(n) for n in numbers if n]
-            
-            if len(clean_nums) >= 9:
-                tot_amt = clean_nums[-1]
-                tot_vol = int(tot_amt / 10.0) if tot_amt != 0 else 0
-                
+        for idx, ul in enumerate(stock_lists[:2]):
+            cat_label = categories[idx]
+            li_items = ul.find_all("li", recursive=False)
+            for li in li_items:
+                # 1. 從 title 屬性擷取完整交易日期（例如：2026-11-11）
+                title_attr = li.get("title", "")
+                date_match = re.search(r"(\d{4}-\d{2}-\d{2})", title_attr)
+                row_date = date_match.group(1) if date_match else (target_date or get_tw_today().strftime("%Y-%m-%d"))
+                detected_dates.add(row_date)
+
+                # 2. 從 onclick='goUrl("2308");' 擷取股票代號
+                onclick_attr = li.get("onclick", "")
+                code_match = re.search(r'goUrl\(["\']([^"\']+)["\']\)', onclick_attr)
+                stock_code = code_match.group(1).strip() if code_match else ""
+
+                # 3. 取得直接子層 <span>（共 11 欄：名次、股票名、8大行庫、合計(萬)）
+                spans = li.find_all("span", recursive=False)
+                if len(spans) < 11 or not stock_code:
+                    continue
+
+                stock_name = spans[1].get_text(strip=True).replace("\xa0", "")
+                bank_amts = [_clean_num(spans[i].get_text(strip=True)) for i in range(2, 10)]
+                tot_amt = _clean_num(spans[10].get_text(strip=True))
+
+                # 寫入「全部官股合計」（HiStock 僅提供金額萬元，不偽造張數）
                 records.append({
-                    "交易日期": actual_trade_date,
+                    "交易日期": row_date,
                     "官股分點": "全部官股合計",
                     "代號": stock_code,
                     "名稱": stock_name,
-                    "買進張數": tot_vol if tot_vol > 0 else 0,
-                    "賣出張數": abs(tot_vol) if tot_vol < 0 else 0,
-                    "買賣超張數": tot_vol,
+                    "買進張數": 0,
+                    "賣出張數": 0,
+                    "買賣超張數": 0,
                     "金額(萬元)": round(tot_amt, 2)
                 })
-                
-                for b_i, b_short in enumerate(branch_order):
-                    if b_i < len(clean_nums) - 1:
-                        b_amt = clean_nums[b_i]
-                        b_vol = int(b_amt / 10.0) if b_amt != 0 else 0
-                        if b_amt != 0:
-                            records.append({
-                                "交易日期": actual_trade_date,
-                                "官股分點": HISTOCK_BRANCH_COLS[b_short],
-                                "代號": stock_code,
-                                "名稱": stock_name,
-                                "買進張數": b_vol if b_vol > 0 else 0,
-                                "賣出張數": abs(b_vol) if b_vol < 0 else 0,
-                                "買賣超張數": b_vol,
-                                "金額(萬元)": round(b_amt, 2)
-                            })
 
-        print(f"\n[DEBUG_HISTOCK] 總計解析記錄數: {len(records)}", flush=True)
+                # 寫入八大公股行庫各自買賣超金額（萬元）
+                for b_idx, (_, bank_std_name) in enumerate(HISTOCK_BRANCH_ORDER):
+                    b_amt = bank_amts[b_idx]
+                    if b_amt != 0:
+                        records.append({
+                            "交易日期": row_date,
+                            "官股分點": bank_std_name,
+                            "代號": stock_code,
+                            "名稱": stock_name,
+                            "買進張數": 0,
+                            "賣出張數": 0,
+                            "買賣超張數": 0,
+                            "金額(萬元)": round(b_amt, 2)
+                        })
+
+        actual_trade_date = sorted(detected_dates)[-1] if detected_dates else (target_date or get_tw_today().strftime("%Y-%m-%d"))
+        print(f"[DEBUG_HISTOCK] 辨識交易日: {actual_trade_date}, 總解析筆數: {len(records)}", flush=True)
         print("=" * 60 + "\n", flush=True)
 
         if records:
             res_df = pd.DataFrame(records).drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
-            return res_df, actual_trade_date, f"成功解析 {len(res_df)} 筆真實數據", debug_tables_info
+            debug_tables_info.append({
+                "來源": "解析結果摘要",
+                "實際交易日期": actual_trade_date,
+                "總寫入列數": len(res_df),
+                "涵蓋個股數": res_df["代號"].nunique()
+            })
+            return res_df, actual_trade_date, f"成功解析 {actual_trade_date} 共 {res_df['代號'].nunique()} 檔個股（{len(res_df)} 筆明細）", debug_tables_info
 
-        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未抓到有效數據列（請檢視下方診斷資訊）", debug_tables_info
+        return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), actual_trade_date, "未抓到有效個股數據列", debug_tables_info
 
     except Exception as e:
         print(f"[DEBUG_HISTOCK] 解析拋出例外: {e}", flush=True)
@@ -278,20 +296,23 @@ def fetch_histock_latest_gov_trades() -> tuple[pd.DataFrame, str, str, list]:
         print("=" * 60 + "\n", flush=True)
         return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS), "", f"解析例外: {str(e)}", debug_tables_info
 
+
 def sync_df_to_storage(df: pd.DataFrame) -> bool:
     """持久化保存至本地 CSV 與 Google Drive"""
     if df.empty:
         return False
     try:
         if os.path.exists(LOCAL_GOV_FILE):
-            existing_df = pd.read_csv(LOCAL_GOV_FILE)
+            existing_df = pd.read_csv(LOCAL_GOV_FILE, dtype={"代號": str})
             if "買賣超金額(萬元)" in existing_df.columns and "金額(萬元)" not in existing_df.columns:
                 existing_df = existing_df.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
-            combined = pd.concat([existing_df, df], ignore_index=True)
+            df_copy = df.copy()
+            df_copy["代號"] = df_copy["代號"].astype(str)
+            combined = pd.concat([existing_df, df_copy], ignore_index=True)
             combined = combined.drop_duplicates(subset=["交易日期", "官股分點", "代號"], keep="last")
         else:
-            combined = df
-            
+            combined = df.copy()
+            combined["代號"] = combined["代號"].astype(str)
         combined.to_csv(LOCAL_GOV_FILE, index=False)
         cloud_sync.upload_file_to_drive(LOCAL_GOV_FILE, "gov_trades_history.csv")
         clear_gov_cache()
@@ -300,14 +321,30 @@ def sync_df_to_storage(df: pd.DataFrame) -> bool:
         print(f"[data_loader] 歷史官股落地同步失敗: {e}", flush=True)
         return False
 
-@st.cache_data(ttl=1800)
-def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
-    """純讀取模式：取得指定日期官股資料（優先自落地歷史庫中讀取）"""
+
+def get_latest_available_gov_date() -> datetime.date:
+    """取得資料庫中最新一筆官股交易日；若資料庫為空則回傳台灣今日日期"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
     if os.path.exists(LOCAL_GOV_FILE):
         try:
             cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            if not cached_db.empty and "交易日期" in cached_db.columns:
+                max_d = str(cached_db["交易日期"].dropna().max())
+                return datetime.datetime.strptime(max_d, "%Y-%m-%d").date()
+        except Exception:
+            pass
+    return get_tw_today()
+
+
+@st.cache_data(ttl=1800)
+def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
+    """純讀取模式：取得指定日期官股資料（自落地歷史庫中讀取）"""
+    if not os.path.exists(LOCAL_GOV_FILE):
+        cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
+    if os.path.exists(LOCAL_GOV_FILE):
+        try:
+            cached_db = pd.read_csv(LOCAL_GOV_FILE, dtype={"代號": str})
             if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
                 cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
             match_rows = cached_db[cached_db["交易日期"] == trade_date]
@@ -317,14 +354,15 @@ def fetch_gov_branch_trades(trade_date: str) -> pd.DataFrame:
             pass
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
 
+
 @st.cache_data(ttl=1800)
 def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFrame:
-    """純讀取模式：自落地歷史庫彙總區間統計，不自動在背後隱蔽回補"""
+    """純讀取模式：自落地歷史庫彙總區間統計"""
     if not os.path.exists(LOCAL_GOV_FILE):
         cloud_sync.download_file_from_drive("gov_trades_history.csv", LOCAL_GOV_FILE)
     if os.path.exists(LOCAL_GOV_FILE):
         try:
-            cached_db = pd.read_csv(LOCAL_GOV_FILE)
+            cached_db = pd.read_csv(LOCAL_GOV_FILE, dtype={"代號": str})
             if "買賣超金額(萬元)" in cached_db.columns and "金額(萬元)" not in cached_db.columns:
                 cached_db = cached_db.rename(columns={"買賣超金額(萬元)": "金額(萬元)"})
             if not cached_db.empty and "交易日期" in cached_db.columns:
@@ -333,3 +371,145 @@ def fetch_range_gov_branch_summary(start_date: str, end_date: str) -> pd.DataFra
         except Exception:
             pass
     return pd.DataFrame(columns=EMPTY_TRADE_COLUMNS)
+
+
+# =====================================================================
+# 個股區間券商分點進出與前五大分點逐日明細（MoneyDJ zco / zco0 引擎）
+# =====================================================================
+
+def is_gov_broker_branch(broker_name: str) -> bool:
+    """判斷分點名稱是否隸屬於八大官股體系（涵蓋總公司與各地分公司）"""
+    clean_name = str(broker_name).strip()
+    return any(clean_name.startswith(prefix) for prefix in GOV_BROKER_PREFIXES)
+
+
+def _normalize_tw_date(date_str: str) -> str:
+    """將民國年 (115/10/07) 或西元年 (2026/10/07) 統一轉為 YYYY-MM-DD"""
+    s = str(date_str).strip()
+    m = re.match(r"^(\d{2,4})[/\-](\d{1,2})[/\-](\d{1,2})$", s)
+    if not m:
+        return s
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if y < 1911:
+        y += 1911
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _build_detail_url_with_range(raw_href: str, s_mdj: str, e_mdj: str) -> str:
+    """解析分點明細連結並強制帶入指定起迄日期參數 e 與 f"""
+    full_url = urljoin(MDJ_BASE_DOMAIN, raw_href)
+    parsed = urlparse(full_url)
+    qs = parse_qs(parsed.query)
+    qs["e"] = [s_mdj]
+    qs["f"] = [e_mdj]
+    new_query = urlencode(qs, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+
+@st.cache_data(ttl=1800)
+def fetch_stock_broker_range_ranking(stock_id: str, start_date: str, end_date: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    抓取單一股票在指定期間（start_date ~ end_date）的買超與賣超分點排行榜
+    回傳: (df_buy, df_sell)，內含「是否官股分點」標記與明細網址
+    """
+    s_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date()
+    e_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d").date()
+    s_mdj = f"{s_dt.year}-{s_dt.month}-{s_dt.day}"
+    e_mdj = f"{e_dt.year}-{e_dt.month}-{e_dt.day}"
+    main_url = f"{MDJ_BASE_DOMAIN}/z/zc/zco/zco.djhtm?a={stock_id}&e={s_mdj}&f={e_mdj}"
+
+    try:
+        resp = requests.get(main_url, headers=MDJ_HEADERS, timeout=15)
+        resp.encoding = "big5"
+        if resp.status_code != 200:
+            return pd.DataFrame(), pd.DataFrame()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        buy_list = []
+        sell_list = []
+
+        for tbl in soup.find_all("table"):
+            for tr in tbl.find_all("tr"):
+                cells = tr.find_all(["td", "th"])
+                texts = [c.get_text(strip=True) for c in cells]
+                if len(texts) in (8, 10):
+                    half = len(texts) // 2
+                    left_txt = texts[:half]
+                    right_txt = texts[half:]
+                    left_cells = cells[:half]
+                    right_cells = cells[half:]
+
+                    if left_txt[0] and left_txt[0] not in ("買超券商", "券商名稱", "分點") and any(c.isdigit() for c in left_txt[-1]):
+                        a_tag = left_cells[0].find("a", href=True)
+                        detail_url = _build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
+                        b_name = left_txt[0]
+                        buy_list.append({
+                            "分點名稱": b_name,
+                            "體系": "八大官股" if is_gov_broker_branch(b_name) else "一般券商",
+                            "買進(張)": int(_clean_num(left_txt[1])),
+                            "賣出(張)": int(_clean_num(left_txt[2])),
+                            "買賣超(張)": int(_clean_num(left_txt[3])),
+                            "佔比": left_txt[4] if len(left_txt) > 4 else "",
+                            "明細網址": detail_url
+                        })
+
+                    if right_txt[0] and right_txt[0] not in ("賣超券商", "券商名稱", "分點") and any(c.isdigit() for c in right_txt[-1]):
+                        a_tag = right_cells[0].find("a", href=True)
+                        detail_url = _build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
+                        s_name = right_txt[0]
+                        sell_list.append({
+                            "分點名稱": s_name,
+                            "體系": "八大官股" if is_gov_broker_branch(s_name) else "一般券商",
+                            "買進(張)": int(_clean_num(right_txt[1])),
+                            "賣出(張)": int(_clean_num(right_txt[2])),
+                            "買賣超(張)": int(_clean_num(right_txt[3])),
+                            "佔比": right_txt[4] if len(right_txt) > 4 else "",
+                            "明細網址": detail_url
+                        })
+
+        return pd.DataFrame(buy_list), pd.DataFrame(sell_list)
+    except Exception as e:
+        print(f"[data_loader] 抓取個股分點區間排行失敗 ({stock_id}): {e}", flush=True)
+        return pd.DataFrame(), pd.DataFrame()
+
+
+@st.cache_data(ttl=1800)
+def fetch_single_broker_daily_series(detail_url: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    抓取單一分點在指定區間內的逐日買賣超明細 (zco0.djhtm)
+    精準以 買進(張) - 賣出(張) 計算真實淨買賣超張數
+    """
+    if not detail_url:
+        return pd.DataFrame()
+    try:
+        resp = requests.get(detail_url, headers=MDJ_HEADERS, timeout=15)
+        resp.encoding = "big5"
+        if resp.status_code != 200:
+            return pd.DataFrame()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        daily_rows = []
+        for tbl in soup.find_all("table"):
+            for tr in tbl.find_all("tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if len(tds) >= 4 and re.match(r"^\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2}$", tds[0]):
+                    norm_date = _normalize_tw_date(tds[0])
+                    if not (start_date <= norm_date <= end_date):
+                        continue
+                    buy_vol = int(_clean_num(tds[1]))
+                    sell_vol = int(_clean_num(tds[2]))
+                    net_vol = buy_vol - sell_vol
+                    daily_rows.append({
+                        "日期": norm_date,
+                        "買進(張)": buy_vol,
+                        "賣出(張)": sell_vol,
+                        "買賣超(張)": net_vol
+                    })
+
+        if not daily_rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(daily_rows).drop_duplicates(subset=["日期"]).sort_values("日期", ascending=True).reset_index(drop=True)
+    except Exception as e:
+        print(f"[data_loader] 抓取單一分點逐日明細失敗: {e}", flush=True)
+        return pd.DataFrame()

@@ -1,21 +1,18 @@
 """
 模組名稱：app.py
-版本識別：20261112_2235
+版本識別：20261112_2252
 修改目的：
-1. 更新版本識別為台灣時間 20261112_2235。
-2. 模組一（指定日八大官股買/賣超前 30 名）：參數化交易日選擇器，預設為系統最後一個有效交易日（get_latest_available_gov_date），
-   若本地/雲端庫尚無該日資料則自動向 HiStock 即時抓取指定日結算（?d=YYYY-MM-DD）並入庫，完整表列買超與賣超前 30 名（單位：萬元）。
-3. 模組二（指定期間八大官股買/賣超合計各前 30 名）：參數化起迄日期，預設為「最後一個交易日前 1 個月（30 天）至最後一個交易日」，
-   依據真實「金額(萬元)」彙總表列區間買超前 30 名與賣超前 30 名個股及八大行庫分佈明細。
-4. 模組三（買賣超前五名個股下拉選單＋指定期間各分點每日買賣超柱狀圖）：自動篩選指定期間官股買超前 5 名與賣超前 5 名個股放入下拉選單，
-   選定個股後即時抓取該期間買超前 5 大分點與賣超前 5 大分點之逐日淨買賣超張數（買進 - 賣出），以紅買綠賣柱狀圖並列呈現。
+1. 更新版本識別為台灣時間 20261112_2252。
+2. 於【模組 2：指定期間八大官股買/賣超合計各前 30 名】植入「增量差集自動補抓」機制：
+   依據大盤交易日曆（taiex_df['Date']）比對資料庫已存檔日期，僅針對尚缺漏的交易日向 HiStock 補抓（?d=YYYY-MM-DD）
+   並透過 batch_sync_gov_records() 一次性合併入庫與上傳 Google Drive（已存在日期絕不重抓）。
+3. 於期間提示列明確顯示「應有交易日數」與「資料庫實際涵蓋交易日數」，確保期間加總透明可驗證。
 防呆防錯原因：
-1. 全面修正舊版 app.py 依賴「買賣超張數」之錯誤邏輯（HiStock 僅提供金額萬元），所有排行、加總與圖表標題皆改用真實「金額(萬元)」。
-2. 指定日若遇假日或資料庫尚未回補，自動觸發 fetch_histock_latest_gov_trades(target_date) 線上補抓並顯示實際成交日提示，避免空白畫面。
-3. 各分點逐日明細請求加入 0.25 秒間隔與獨立異常防護，確保 Streamlit Cloud 穩定連線不逾時。
+1. 若使用者選擇長天期區間（例如超過 1 年），單次增量補抓上限防護為最近 65 個缺漏交易日並附進度條，避免雲端執行逾時。
+2. 增量補抓完成後自動清除快取並重新讀取該期間彙總表，確保當下畫面立即反映完整期間加總結果。
 """
 
-MODULE_VERSION = "20261112_2235"
+MODULE_VERSION = "20261112_2252"
 
 import time
 import datetime
@@ -35,6 +32,8 @@ from data_loader import (
     purge_gov_database,
     fetch_histock_latest_gov_trades,
     sync_df_to_storage,
+    batch_sync_gov_records,
+    get_missing_gov_trade_dates,
     get_latest_available_gov_date,
     fetch_stock_broker_range_ranking,
     fetch_single_broker_daily_series,
@@ -164,6 +163,7 @@ if taiex_df.empty:
     st.stop()
 
 date_to_idx = {row["Date"]: idx for idx, row in taiex_df.iterrows()}
+valid_tw_trade_dates = taiex_df["Date"].dropna().astype(str).tolist()
 
 # 3. 政策事件快速跳轉控制區
 st.subheader("政策事件快速定位")
@@ -266,7 +266,6 @@ else:
                 .sum()
             )
 
-    # 若選「全部官股合計」，額外橫向展開八大行庫各自金額明細供對照
     if selected_bank == "全部官股合計":
         branch_only_day = single_day_df[single_day_df["官股分點"] != "全部官股合計"]
         if not branch_only_day.empty:
@@ -310,7 +309,7 @@ else:
 st.markdown("---")
 
 # =====================================================================
-# 模組 (2)：指定期間八大官股買/賣超合計各前 30 名（預設最後交易日前 1 個月）
+# 模組 (2)：指定期間八大官股買/賣超合計各前 30 名（增量補抓缺漏交易日）
 # =====================================================================
 st.subheader("【2. 指定期間】八大官股買／賣超合計各前 30 名")
 col_qs, col_qe = st.columns(2)
@@ -324,17 +323,46 @@ if stat_start > stat_end:
 
 s_range_str = stat_start.strftime("%Y-%m-%d")
 e_range_str = stat_end.strftime("%Y-%m-%d")
-st.info(f"當前統計期間：**{s_range_str}** 至 **{e_range_str}**（單位：萬元）")
+
+# 增量差集比對：找出此期間內資料庫尚缺漏的台股交易日，僅補抓缺漏日（已存在日不重抓）
+expected_trade_days, missing_trade_days = get_missing_gov_trade_dates(
+    s_range_str, e_range_str, valid_tw_trade_dates
+)
+
+if missing_trade_days:
+    # 單次自動增量補抓上限防護（最多 65 個缺漏交易日）
+    days_to_fetch = missing_trade_days[-65:]
+    prog_bar = st.progress(0, text=f"偵測到期間內尚缺 {len(days_to_fetch)} 個交易日資料，啟動增量補抓（已存檔日跳過不重抓）...")
+    fetched_batches = []
+    for idx_m, m_day in enumerate(days_to_fetch):
+        prog_bar.progress(
+            int(((idx_m + 1) / len(days_to_fetch)) * 100),
+            text=f"增量補抓中 ({idx_m + 1}/{len(days_to_fetch)})：{m_day}..."
+        )
+        df_m, actual_m, _, _ = fetch_histock_latest_gov_trades(target_date=m_day)
+        if not df_m.empty and actual_m == m_day:
+            fetched_batches.append(df_m)
+        time.sleep(0.25)
+
+    if fetched_batches:
+        batch_sync_gov_records(fetched_batches)
+    prog_bar.empty()
 
 range_summary_df = fetch_range_gov_branch_summary(s_range_str, e_range_str)
+covered_days_count = range_summary_df["交易日期"].nunique() if not range_summary_df.empty else 0
+
+st.info(
+    f"當前統計期間：**{s_range_str}** 至 **{e_range_str}**（單位：萬元）｜ "
+    f"期間台股交易日：**{len(expected_trade_days)}** 天 ｜ "
+    f"資料庫已涵蓋：**{covered_days_count}** 天"
+)
 
 top5_buy_stocks = pd.DataFrame()
 top5_sell_stocks = pd.DataFrame()
 
 if range_summary_df.empty:
-    st.warning("所選統計期間內資料庫尚無官股紀錄。請先使用上方指定日查詢或左側欄「⚡ 抓取 HiStock 最新真實官股結算」累積資料。")
+    st.warning("所選統計期間內查無八大官股紀錄。")
 else:
-    # 計算區間「全部官股合計」各個股總金額
     range_total_df = range_summary_df[range_summary_df["官股分點"] == "全部官股合計"]
     if range_total_df.empty:
         range_total_df = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
@@ -345,7 +373,6 @@ else:
         .rename(columns={"金額(萬元)": "官股合計(萬元)"})
     )
 
-    # 橫向展開八大行庫於該期間各自累計金額
     range_branch_only = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
     if not range_branch_only.empty:
         piv_range = pd.pivot_table(
@@ -368,7 +395,6 @@ else:
     range_buy_top30.index = range_buy_top30.index + 1
     range_sell_top30.index = range_sell_top30.index + 1
 
-    # 保留買超前 5 名與賣超前 5 名個股供模組 (3) 下拉選單使用
     top5_buy_stocks = range_buy_top30.head(5).copy()
     top5_sell_stocks = range_sell_top30.head(5).copy()
 
@@ -458,7 +484,6 @@ else:
         if df_b_rank.empty and df_s_rank.empty:
             st.warning(f"無法取得【{sel_code} {sel_name}】在 {s_range_str} ~ {e_range_str} 的券商分點數據。")
         else:
-            # 先呈現該期間買賣超分點總表（含八大官股體系標記）
             with st.expander(f"📋 查看【{sel_code} {sel_name}】指定期間買賣超前 15 大分點總表（含八大官股篩選）", expanded=False):
                 c_b_tbl, c_s_tbl = st.columns(2)
                 with c_b_tbl:
@@ -470,7 +495,6 @@ else:
                     if not df_s_rank.empty:
                         st.dataframe(df_s_rank.drop(columns=["明細網址"]).head(15), use_container_width=True, hide_index=True)
 
-            # 繪製買超前 5 名分點每日買賣超柱狀圖
             st.markdown(f"#### 🔴【{sel_code} {sel_name}】買超前 5 名分點：每日買賣超柱狀圖（張）")
             if not df_b_rank.empty:
                 for idx, row in df_b_rank.head(5).iterrows():
@@ -487,7 +511,6 @@ else:
                         st.caption(f"買超 Top {idx + 1}：{b_name} 無逐日明細資料。")
                     time.sleep(0.25)
 
-            # 繪製賣超前 5 名分點每日買賣超柱狀圖
             st.markdown(f"#### 🟢【{sel_code} {sel_name}】賣超前 5 名分點：每日買賣超柱狀圖（張）")
             if not df_s_rank.empty:
                 for idx, row in df_s_rank.head(5).iterrows():

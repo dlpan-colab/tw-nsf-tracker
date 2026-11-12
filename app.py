@@ -1,266 +1,440 @@
 """
-模組名稱：app.py（個股分點區間排行 + 前五大買賣超分點每日買賣超柱狀圖修正版）
-版本識別：20261112_1628_BROKER_DAILY_BAR_FIX
+模組名稱：app.py
+版本識別：20261112_0007
 修改目的：
-1. 修正 zco0.djhtm 逐日明細欄位解析錯誤：原誤抓第 4 欄（總成交張數 = 買進 + 賣出），現改為精準計算「買進(張) - 賣出(張)」並核對第 5 欄買賣超張數，真實呈現每日買超（正值紅柱）與賣超（負值綠柱）。
-2. 加入日期區間過濾（start_date <= 日期 <= end_date）與動態區間參數帶入，排除 zco0.djhtm 預設回傳之區間外最新交易日（如 11/11），確保圖表橫軸與設定區間完全一致。
-3. 同時顯示「區間明細加總驗算」於圖表標題，供與主表區間累計張數即時核對。
+1. 更新版本識別為台灣時間 20261112_0007。
+2. 診斷展開區全面改用防呆取值（.get()），徹底排除 KeyError: 'idx' 崩潰。
+3. 終端機 print 加入 flush=True，確保後台日誌不再被緩衝區吞沒。
 防呆防錯原因：
-1. 避免欄位順序變動導致買賣超正負號反轉，直接以 `buy_vol - sell_vol` 作為核心買賣超計算基準。
-2. 於分點明細連結動態覆寫 `e`（起日）與 `f`（迄日）參數，並於本地 DataFrame 再執行一次日期區間篩選，雙重防止區間外數據混入。
+1. 避免 data_loader.py 回傳不同字典結構時造成取值中斷，保證前台穩定運行。
 """
 
-import re
-import time
-import datetime
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
-from zoneinfo import ZoneInfo
-import requests
-import pandas as pd
-import altair as alt
-from bs4 import BeautifulSoup
+MODULE_VERSION = "20261112_0007"
+
 import streamlit as st
+import datetime
+from zoneinfo import ZoneInfo
+import pandas as pd
+import plotly.graph_objects as go
+import data_loader
+import chart_builder
+import frontend
+import cloud_sync
 
-TW_TZ = ZoneInfo("Asia/Taipei")
-TEST_VERSION = "20261112_1628_BROKER_DAILY_BAR_FIX"
-BASE_DOMAIN = "https://fubon-ebrokerdj.fbs.com.tw"
+from data_loader import (
+    load_policy_events,
+    fetch_taiex_data,
+    fetch_gov_branch_trades,
+    fetch_range_gov_branch_summary,
+    purge_gov_database,
+    fetch_histock_latest_gov_trades,
+    sync_df_to_storage,
+    GOV_BANKS,
+    get_tw_today
+)
+from chart_builder import build_taiex_chart
+from frontend import render_interactive_chart
 
-st.set_page_config(page_title="個股分點區間與每日柱狀圖", layout="wide")
-st.caption(f"修正版本（台灣時間）：{TEST_VERSION}")
-st.subheader("📊 個股區間分點排行與前五大買賣超分點每日柱狀圖")
+all_versions = [
+    getattr(data_loader, "MODULE_VERSION", "0"),
+    getattr(chart_builder, "MODULE_VERSION", "0"),
+    getattr(frontend, "MODULE_VERSION", "0"),
+    getattr(cloud_sync, "MODULE_VERSION", "0"),
+    MODULE_VERSION
+]
+SYSTEM_VERSION = max(all_versions)
 
-col_in1, col_in2, col_in3 = st.columns(3)
-with col_in1:
-    stock_id = st.text_input("輸入 1：股票代碼", value="2308").strip()
-with col_in2:
-    start_date = st.date_input("輸入 2（起日）", value=datetime.date(2026, 10, 7))
-with col_in3:
-    end_date = st.date_input("輸入 2（迄日）", value=datetime.date(2026, 11, 6))
+st.set_page_config(page_title="國安基金動向與八大官股分點分析", layout="wide")
 
-REQ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": f"{BASE_DOMAIN}/"
+st.markdown("""
+<style>
+div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    gap: 6px !important;
+    align-items: center !important;
 }
+div[data-testid="stHorizontalBlock"] > div {
+    min-width: 0 !important;
+    flex: 1 1 auto !important;
+}
+.action-title {
+    font-size: 14px;
+    font-weight: bold;
+    white-space: nowrap;
+}
+</style>
+""", unsafe_allow_html=True)
 
+st.caption(f"系統版本識別（台灣時間）：{SYSTEM_VERSION}")
+st.subheader("國安基金政策標記與官股分點進出分析 (tw-nsf-tracker)")
 
-def clean_int(val_str: str) -> int:
-    """清理千分位逗號與空白並轉為整數"""
-    cleaned = re.sub(r"[,\s\xa0張]", "", str(val_str or ""))
-    if cleaned in ("", "-", "--", "—"):
-        return 0
-    return int(float(cleaned))
+today_tw = get_tw_today()
 
+if "focus_target_idx" not in st.session_state:
+    st.session_state.focus_target_idx = None
+if "focus_date_val" not in st.session_state:
+    st.session_state.focus_date_val = today_tw
 
-def normalize_tw_date(date_str: str) -> str:
-    """將民國年 (115/10/07) 或西元年 (2026/10/07) 統一轉為 YYYY-MM-DD"""
-    s = str(date_str).strip()
-    m = re.match(r"^(\d{2,4})[/\-](\d{1,2})[/\-](\d{1,2})$", s)
-    if not m:
-        return s
-    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if y < 1911:
-        y += 1911
-    return f"{y:04d}-{mo:02d}-{d:02d}"
+for key in ["idx_NSF_AUTH", "idx_NSF_EXIT", "idx_SHORT_RESTRICT", "idx_SHORT_LIFT"]:
+    if key not in st.session_state:
+        st.session_state[key] = -1
 
+# 側邊欄設定
+st.sidebar.header("圖表顯示設定")
+display_days = st.sidebar.slider("K線預設顯示天數", min_value=10, max_value=120, value=30, step=5)
 
-def build_detail_url_with_range(raw_href: str, s_mdj: str, e_mdj: str) -> str:
-    """解析分點明細連結並強制帶入指定起迄日期參數 e 與 f"""
-    full_url = urljoin(BASE_DOMAIN, raw_href)
-    parsed = urlparse(full_url)
-    qs = parse_qs(parsed.query)
-    qs["e"] = [s_mdj]
-    qs["f"] = [e_mdj]
-    new_query = urlencode(qs, doseq=True)
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+st.sidebar.markdown("---")
+st.sidebar.header("大盤行情載入區間")
+start_default = datetime.date(2000, 1, 1)
+end_default = today_tw
+col_s, col_e = st.sidebar.columns(2)
+start_date = col_s.date_input("大盤載入起日", start_default)
+end_date = col_e.date_input("大盤載入迄日", end_default)
 
+if start_date > end_date:
+    st.sidebar.error("大盤載入起日不能晚於迄日！")
+    st.stop()
 
-def parse_range_ranking(html_text: str, s_mdj: str, e_mdj: str):
-    """解析區間買賣超分點主表，回傳含明細連結的買超清單與賣超清單"""
-    soup = BeautifulSoup(html_text, "html.parser")
-    buy_list = []
-    sell_list = []
+# 側邊欄：獨立「資料庫維護與真實回補」功能區
+st.sidebar.markdown("---")
+st.sidebar.header("官股資料維護與回補")
 
-    for tbl in soup.find_all("table"):
-        for tr in tbl.find_all("tr"):
-            cells = tr.find_all(["td", "th"])
-            texts = [c.get_text(strip=True) for c in cells]
-            if len(texts) in (8, 10):
-                half = len(texts) // 2
-                left_txt = texts[:half]
-                right_txt = texts[half:]
-                left_cells = cells[:half]
-                right_cells = cells[half:]
+if st.sidebar.button("⚡ 抓取 HiStock 最新真實官股結算", use_container_width=True):
+    print("\n" + "#" * 60, flush=True)
+    print("[APP] 使用者觸發【抓取 HiStock 最新真實官股結算】，執行診斷日誌...", flush=True)
+    with st.spinner("正在抓取 HiStock 並解析表格結構..."):
+        df_real, actual_d, status_msg, debug_info = fetch_histock_latest_gov_trades()
+        print(f"[APP] 執行結果: 取得筆數={len(df_real)}, 日期={actual_d}, 訊息={status_msg}", flush=True)
+        print("#" * 60 + "\n", flush=True)
+        
+        st.session_state["histock_debug_info"] = debug_info
+        st.session_state["histock_status_msg"] = status_msg
+        
+        if not df_real.empty:
+            ok = sync_df_to_storage(df_real)
+            if ok:
+                st.session_state.focus_date_val = datetime.datetime.strptime(actual_d, "%Y-%m-%d").date()
+                st.sidebar.success(f"【成功入庫】已取得 {actual_d} 共 {len(df_real)} 筆官股資料！")
+                st.rerun()
+            else:
+                st.sidebar.error("寫入 Google Drive 失敗，請檢查憑證。")
+        else:
+            st.sidebar.info(f"回報：{status_msg}")
 
-                # 左側：買超分點
-                if left_txt[0] and left_txt[0] not in ("買超券商", "券商名稱", "分點") and any(c.isdigit() for c in left_txt[-1]):
-                    a_tag = left_cells[0].find("a", href=True)
-                    detail_url = build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
-                    buy_list.append({
-                        "分點名稱": left_txt[0],
-                        "買進(張)": clean_int(left_txt[1]),
-                        "賣出(張)": clean_int(left_txt[2]),
-                        "買賣超(張)": clean_int(left_txt[3]),
-                        "佔比": left_txt[4] if len(left_txt) > 4 else "",
-                        "明細網址": detail_url
-                    })
+if "histock_debug_info" in st.session_state and st.session_state["histock_debug_info"]:
+    with st.sidebar.expander("🔍 查看 HiStock 表格結構診斷"):
+        st.write(f"狀態：{st.session_state.get('histock_status_msg', '')}")
+        for idx, t in enumerate(st.session_state["histock_debug_info"]):
+            src_label = t.get("來源", f"表格 #{t.get('idx', idx)}")
+            shape_info = f" (形狀: {t['shape']})" if "shape" in t else ""
+            st.markdown(f"**{src_label}{shape_info}**")
+            if "columns" in t:
+                st.code(str(t["columns"]), language="python")
+            if t.get("head2"):
+                st.json(t["head2"])
+            other_info = {k: v for k, v in t.items() if k not in ["來源", "idx", "shape", "columns", "head2"]}
+            if other_info:
+                st.json(other_info)
 
-                # 右側：賣超分點
-                if right_txt[0] and right_txt[0] not in ("賣超券商", "券商名稱", "分點") and any(c.isdigit() for c in right_txt[-1]):
-                    a_tag = right_cells[0].find("a", href=True)
-                    detail_url = build_detail_url_with_range(a_tag["href"], s_mdj, e_mdj) if a_tag else ""
-                    sell_list.append({
-                        "分點名稱": right_txt[0],
-                        "買進(張)": clean_int(right_txt[1]),
-                        "賣出(張)": clean_int(right_txt[2]),
-                        "買賣超(張)": clean_int(right_txt[3]),
-                        "佔比": right_txt[4] if len(right_txt) > 4 else "",
-                        "明細網址": detail_url
-                    })
+if st.sidebar.button("🗑️ 清除歷史資料庫", use_container_width=True):
+    print("\n[APP] 使用者觸發【清除歷史資料庫】...", flush=True)
+    if purge_gov_database():
+        st.sidebar.success("已成功清空本機與雲端舊資料庫！")
+        st.rerun()
+    else:
+        st.sidebar.error("清空資料庫失敗，請檢查雲端金鑰連線。")
 
-    return pd.DataFrame(buy_list), pd.DataFrame(sell_list)
+# 2. 載入大盤資料
+events_df = load_policy_events("policy_events.json")
 
+with st.spinner("載入加權指數歷史數據與雲端同步中..."):
+    taiex_df = fetch_taiex_data(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
-def fetch_broker_daily_series(detail_url: str, s_iso: str, e_iso: str) -> pd.DataFrame:
-    """抓取單一分點逐日明細 (zco0.djhtm)，精準計算買賣超(買進-賣出)並過濾指定日期區間"""
-    if not detail_url:
-        return pd.DataFrame()
-    resp = requests.get(detail_url, headers=REQ_HEADERS, timeout=15)
-    resp.encoding = "big5"
-    if resp.status_code != 200:
-        return pd.DataFrame()
+if taiex_df.empty:
+    st.error("加權指數資料取得為空，請檢查網路連線或日期區間。")
+    st.stop()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    daily_rows = []
-    for tbl in soup.find_all("table"):
-        for tr in tbl.find_all("tr"):
-            tds = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-            # zco0.djhtm 逐日明細列結構：[日期, 買進, 賣出, 成交張數(買+賣), 買賣超(買-賣)]
-            if len(tds) >= 4 and re.match(r"^\d{2,4}[/\-]\d{1,2}[/\-]\d{1,2}$", tds[0]):
-                norm_date = normalize_tw_date(tds[0])
-                # 防呆過濾：僅保留使用者指定區間內的交易日
-                if not (s_iso <= norm_date <= e_iso):
-                    continue
+date_to_idx = {row["Date"]: idx for idx, row in taiex_df.iterrows()}
 
-                buy_vol = clean_int(tds[1])
-                sell_vol = clean_int(tds[2])
-                # 直接以 買進 - 賣出 計算真實淨買賣超（避免誤抓第 4 欄總成交量）
-                net_vol = buy_vol - sell_vol
+# 3. 政策事件快速跳轉控制區
+st.subheader("政策事件快速定位")
 
-                daily_rows.append({
-                    "日期": norm_date,
-                    "買進(張)": buy_vol,
-                    "賣出(張)": sell_vol,
-                    "買賣超(張)": net_vol,
-                    "方向": "買超" if net_vol >= 0 else "賣超"
-                })
+def jump_event(event_type: str, direction: int):
+    sub_df = events_df[events_df["type"] == event_type].sort_values("Date").reset_index(drop=True)
+    if sub_df.empty:
+        st.warning(f"目前無此事件資料：{event_type}")
+        return
+    state_key = f"idx_{event_type}"
+    curr = st.session_state[state_key]
+    new_idx = curr + direction
+    if new_idx < 0:
+        new_idx = 0
+        st.info("已達第一個歷史事件。")
+    elif new_idx >= len(sub_df):
+        new_idx = len(sub_df) - 1
+        st.info("已達最後一個歷史事件。")
+    st.session_state[state_key] = new_idx
+    target_date = sub_df.iloc[new_idx]["Date"]
+    if target_date in date_to_idx:
+        st.session_state.focus_target_idx = int(date_to_idx[target_date])
+        st.session_state.focus_date_val = datetime.datetime.strptime(target_date, "%Y-%m-%d").date()
+    else:
+        future_dates = taiex_df[taiex_df["Date"] >= target_date]
+        if not future_dates.empty:
+            match_date = future_dates.iloc[0]["Date"]
+            st.session_state.focus_target_idx = int(date_to_idx[match_date])
+            st.session_state.focus_date_val = datetime.datetime.strptime(match_date, "%Y-%m-%d").date()
 
-    if not daily_rows:
-        return pd.DataFrame()
+def render_event_buttons(title_html: str, event_key: str):
+    c_title, c_prev, c_next = st.columns([4, 3, 3])
+    with c_title:
+        st.markdown(f"<div class='action-title'>{title_html}</div>", unsafe_allow_html=True)
+    with c_prev:
+        if st.button("上一個", key=f"prev_{event_key}", use_container_width=True):
+            jump_event(event_key, -1)
+    with c_next:
+        if st.button("下一個", key=f"next_{event_key}", use_container_width=True):
+            jump_event(event_key, 1)
 
-    df_d = pd.DataFrame(daily_rows).drop_duplicates(subset=["日期"]).sort_values("日期", ascending=True)
-    return df_d
+render_event_buttons("<span style='color:red;'>國安基金進場 (▲)</span>", "NSF_AUTH")
+render_event_buttons("<span style='color:green;'>國安基金退場 (▼)</span>", "NSF_EXIT")
+render_event_buttons("<span style='color:#D4AC0D;'>金管會限空令 (▲)</span>", "SHORT_RESTRICT")
+render_event_buttons("<span style='color:#2980B9;'>限空令解除 (▼)</span>", "SHORT_LIFT")
 
+if st.button("重設回最新交易日視圖", use_container_width=True):
+    st.session_state.focus_target_idx = None
+    st.session_state.focus_date_val = today_tw
 
-def render_daily_bar_chart(df_daily: pd.DataFrame, title_text: str):
-    """使用 Altair 繪製紅買綠賣每日買賣超柱狀圖（含零軸參考線）"""
-    bars = (
-        alt.Chart(df_daily)
-        .mark_bar(size=14)
-        .encode(
-            x=alt.X("日期:N", title="交易日期", axis=alt.Axis(labelAngle=-45)),
-            y=alt.Y("買賣超(張):Q", title="買賣超 (張)"),
-            color=alt.condition(
-                alt.datum["買賣超(張)"] >= 0,
-                alt.value("#ef5350"),  # 紅柱：當日買超
-                alt.value("#26a69a")   # 綠柱：當日賣超
-            ),
-            tooltip=["日期", "買進(張)", "賣出(張)", "買賣超(張)"]
-        )
-    )
-    zero_rule = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color="#888888", strokeDash=[3, 3]).encode(y="y:Q")
-    chart = (bars + zero_rule).properties(title=title_text, height=250)
-    st.altair_chart(chart, use_container_width=True)
+# 4. 繪製大盤圖表
+chart_fig = build_taiex_chart(
+    taiex_df,
+    events_df,
+    display_bars=display_days,
+    target_date_idx=st.session_state.focus_target_idx
+)
+render_interactive_chart(chart_fig, taiex_df, height=580)
 
+st.markdown("---")
 
-if st.button("🚀 抓取區間排行並繪製前五大分點每日柱狀圖", type="primary", use_container_width=True):
-    s_iso = start_date.strftime("%Y-%m-%d")
-    e_iso = end_date.strftime("%Y-%m-%d")
-    s_mdj = f"{start_date.year}-{start_date.month}-{start_date.day}"
-    e_mdj = f"{end_date.year}-{end_date.month}-{end_date.day}"
-    main_url = f"{BASE_DOMAIN}/z/zc/zco/zco.djhtm?a={stock_id}&e={s_mdj}&f={e_mdj}"
+# 5. 指定交易日官股分點檢視
+st.subheader("【指定交易日】八大官股分點買賣超標的排名")
+col_sel_date, col_sel_bank = st.columns(2)
+with col_sel_date:
+    focus_date = st.date_input("選擇關注交易日", value=st.session_state.focus_date_val)
+with col_sel_bank:
+    selected_bank = st.selectbox("篩選官股券商分點", ["全部官股合計"] + GOV_BANKS)
 
-    with st.spinner("正在抓取區間分點總表..."):
-        try:
-            resp = requests.get(main_url, headers=REQ_HEADERS, timeout=15)
-            resp.encoding = "big5"
-            if resp.status_code != 200:
-                st.error(f"主表連線失敗，HTTP 狀態碼：{resp.status_code}")
-                st.stop()
+single_day_df = fetch_gov_branch_trades(focus_date.strftime("%Y-%m-%d"))
+DISPLAY_COLS = ["代號", "名稱", "買進張數", "賣出張數", "買賣超張數", "金額(萬元)"]
 
-            df_buy, df_sell = parse_range_ranking(resp.text, s_mdj, e_mdj)
-            if df_buy.empty and df_sell.empty:
-                st.error("未解析到任何分點數據，請確認股票代碼與日期區間。")
-                st.stop()
+if single_day_df.empty:
+    st.info(f"{focus_date.strftime('%Y-%m-%d')} 目前資料庫尚無該日真實官股紀錄。若需補充，請於左側欄點擊「⚡ 抓取 HiStock 最新真實官股結算」。")
+else:
+    if selected_bank != "全部官股合計":
+        day_target_df = single_day_df[single_day_df["官股分點"] == selected_bank]
+    else:
+        day_target_df = single_day_df[single_day_df["官股分點"] != "全部官股合計"].groupby(
+            ["代號", "名稱"], as_index=False
+        ).agg({
+            "買進張數": "sum",
+            "賣出張數": "sum",
+            "買賣超張數": "sum",
+            "金額(萬元)": "sum"
+        })
+        if day_target_df.empty:
+            day_target_df = single_day_df[single_day_df["官股分點"] == "全部官股合計"]
 
-            # ---------------------------------------------------------
-            # 1. 表列買賣超前 15 名分點
-            # ---------------------------------------------------------
-            st.markdown("---")
-            st.markdown(f"### 1. `{stock_id}` 區間買賣超前 15 名分點總表（{s_iso} ~ {e_iso}）")
-            col_t1, col_t2 = st.columns(2)
-            with col_t1:
-                st.write("**🔴 買超分點 Top 15**")
-                st.dataframe(df_buy.drop(columns=["明細網址"]).head(15), use_container_width=True)
-            with col_t2:
-                st.write("**🟢 賣超分點 Top 15**")
-                st.dataframe(df_sell.drop(columns=["明細網址"]).head(15), use_container_width=True)
+    buy_pool = day_target_df[day_target_df["金額(萬元)"] > 0].copy()
+    sell_pool = day_target_df[day_target_df["金額(萬元)"] < 0].copy()
 
-            # ---------------------------------------------------------
-            # 2. 買超前 5 名分點：每日買賣超柱狀圖
-            # ---------------------------------------------------------
-            st.markdown("---")
-            st.markdown("### 2. 🔴 買超前 5 名分點：每日買賣超柱狀圖")
-            top5_buy = df_buy.head(5)
-            for idx, row in top5_buy.iterrows():
-                b_name = row["分點名稱"]
-                b_net = row["買賣超(張)"]
-                d_url = row["明細網址"]
-                with st.spinner(f"載入買超第 {idx + 1} 名【{b_name}】逐日明細..."):
-                    df_d = fetch_broker_daily_series(d_url, s_iso, e_iso)
-                    if not df_d.empty:
-                        sub_sum = int(df_d["買賣超(張)"].sum())
-                        render_daily_bar_chart(
-                            df_d,
-                            f"買超 Top {idx + 1}：{b_name}（主表累計：{b_net:+,} 張 ｜ 逐日加總：{sub_sum:+,} 張）"
-                        )
-                    else:
-                        st.warning(f"【{b_name}】在 {s_iso}~{e_iso} 無逐日明細資料。")
-                    time.sleep(0.3)
+    top_buy_30 = buy_pool.sort_values(by="金額(萬元)", ascending=False).head(30).reset_index(drop=True)
+    top_sell_30 = sell_pool.sort_values(by="金額(萬元)", ascending=True).head(30).reset_index(drop=True)
 
-            # ---------------------------------------------------------
-            # 3. 賣超前 5 名分點：每日買賣超柱狀圖
-            # ---------------------------------------------------------
-            st.markdown("---")
-            st.markdown("### 3. 🟢 賣超前 5 名分點：每日買賣超柱狀圖")
-            top5_sell = df_sell.head(5)
-            for idx, row in top5_sell.iterrows():
-                s_name = row["分點名稱"]
-                s_net = row["買賣超(張)"]
-                d_url = row["明細網址"]
-                with st.spinner(f"載入賣超第 {idx + 1} 名【{s_name}】逐日明細..."):
-                    df_d = fetch_broker_daily_series(d_url, s_iso, e_iso)
-                    if not df_d.empty:
-                        sub_sum = int(df_d["買賣超(張)"].sum())
-                        render_daily_bar_chart(
-                            df_d,
-                            f"賣超 Top {idx + 1}：{s_name}（主表累計：{s_net:,} 張 ｜ 逐日加總：{sub_sum:+,} 張）"
-                        )
-                    else:
-                        st.warning(f"【{s_name}】在 {s_iso}~{e_iso} 無逐日明細資料。")
-                    time.sleep(0.3)
+    tab_buy, tab_sell = st.tabs(["🟢 官股買超前 30 名", "🔴 官股賣超前 30 名"])
+    with tab_buy:
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 買超金額前 30 名：**")
+        if not top_buy_30.empty:
+            st.dataframe(top_buy_30[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        else:
+            st.info("當日無官股買超標的紀錄。")
+    with tab_sell:
+        st.markdown(f"**{focus_date.strftime('%Y-%m-%d')} 【{selected_bank}】 賣超金額前 30 名：**")
+        if not top_sell_30.empty:
+            st.dataframe(top_sell_30[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        else:
+            st.info("當日無官股賣超標的紀錄。")
 
-        except Exception as e:
-            st.error(f"執行過程發生異常：{e}")
-            st.exception(e)
+st.markdown("---")
+
+# 6. 日期區間統計模組（純讀取模式）
+st.subheader("【區間統計】官股分點進出彙總分析")
+col_qs, col_qe = st.columns(2)
+stat_start_default = today_tw - datetime.timedelta(days=30)
+stat_start = col_qs.date_input("統計起始日期", stat_start_default)
+stat_end = col_qe.date_input("統計結束日期", today_tw)
+
+if stat_start > stat_end:
+    st.error("統計起始日期不可晚於結束日期！")
+    st.stop()
+
+st.info(f"當前彙總統計區間：**{stat_start.strftime('%Y-%m-%d')}** 至 **{stat_end.strftime('%Y-%m-%d')}**（純讀取真實資料庫）")
+
+range_summary_df = fetch_range_gov_branch_summary(
+    stat_start.strftime("%Y-%m-%d"),
+    stat_end.strftime("%Y-%m-%d")
+)
+
+if range_summary_df.empty:
+    st.info("所選統計區間內查無官股進出紀錄。請先於左側側邊欄點擊「⚡ 抓取 HiStock 最新真實官股結算」。")
+else:
+    tab_branch, tab_stock = st.tabs(["各分點進出個股統計", "個股於各分點統計"])
+    with tab_branch:
+        st.markdown("**各官股分點於所選區間買賣各個股明細（買賣超張數）：**")
+        real_branches_only = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
+        if not real_branches_only.empty:
+            pivot_branch = pd.pivot_table(
+                real_branches_only,
+                values="買賣超張數",
+                index=["官股分點"],
+                columns=["名稱"],
+                aggfunc="sum",
+                fill_value=0
+            )
+            st.dataframe(pivot_branch, use_container_width=True)
+        else:
+            st.info("目前資料庫尚無實體分點明細。")
+
+    with tab_stock:
+        real_stock_subset = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"]
+        if not real_stock_subset.empty:
+            pivot_stock = pd.pivot_table(
+                real_stock_subset,
+                values="買賣超張數",
+                index=["代號", "名稱"],
+                columns=["官股分點"],
+                aggfunc="sum",
+                fill_value=0
+            )
+            pivot_stock["官股買賣超(張)"] = pivot_stock.sum(axis=1)
+        else:
+            pivot_stock = pd.pivot_table(
+                range_summary_df,
+                values="買賣超張數",
+                index=["代號", "名稱"],
+                columns=["官股分點"],
+                aggfunc="sum",
+                fill_value=0
+            )
+            if "全部官股合計" in pivot_stock.columns:
+                pivot_stock = pivot_stock.rename(columns={"全部官股合計": "官股買賣超(張)"})
+            elif "官股買賣超(張)" not in pivot_stock.columns:
+                pivot_stock["官股買賣超(張)"] = pivot_stock.sum(axis=1)
+
+        stock_buy_df = pivot_stock[pivot_stock["官股買賣超(張)"] > 0].sort_values(by="官股買賣超(張)", ascending=False)
+        stock_sell_df = pivot_stock[pivot_stock["官股買賣超(張)"] < 0].sort_values(by="官股買賣超(張)", ascending=True)
+
+        tab_stock_buy, tab_stock_sell = st.tabs(["🟢 區間買超個股統計", "🔴 區間賣超個股統計"])
+        with tab_stock_buy:
+            st.markdown("**所選區間【買超】個股於各分點分佈：**")
+            if not stock_buy_df.empty:
+                st.dataframe(stock_buy_df, use_container_width=True)
+            else:
+                st.info("此區間無合計買超之個股。")
+        with tab_stock_sell:
+            st.markdown("**所選區間【賣超】個股於各分點分佈：**")
+            if not stock_sell_df.empty:
+                st.dataframe(stock_sell_df, use_container_width=True)
+            else:
+                st.info("此區間無合計賣超之個股。")
+
+    st.markdown("---")
+    st.markdown("#### 🔍 個股穿透檢視：官股合計與五大主力分點每日進出走勢")
+
+    stock_summary = range_summary_df[range_summary_df["官股分點"] != "全部官股合計"].groupby(
+        ["代號", "名稱"], as_index=False
+    )["買賣超張數"].sum()
+    if stock_summary.empty:
+        stock_summary = range_summary_df.groupby(["代號", "名稱"], as_index=False)["買賣超張數"].sum()
+
+    buy_sorted = stock_summary[stock_summary["買賣超張數"] > 0].copy()
+    buy_sorted["abs_vol"] = buy_sorted["買賣超張數"].abs()
+    buy_sorted = buy_sorted.sort_values(by="abs_vol", ascending=False)
+
+    sell_sorted = stock_summary[stock_summary["買賣超張數"] < 0].copy()
+    sell_sorted["abs_vol"] = sell_sorted["買賣超張數"].abs()
+    sell_sorted = sell_sorted.sort_values(by="abs_vol", ascending=True)
+
+    ordered_summary = pd.concat([buy_sorted, sell_sorted], ignore_index=True)
+
+    if not ordered_summary.empty:
+        stock_options = [
+            f"{r['代號']} {r['名稱']} ({'+' if r['買賣超張數'] > 0 else ''}{int(r['買賣超張數']):,}張)"
+            for _, r in ordered_summary.iterrows()
+        ]
+        selected_stock_label = st.selectbox("請選擇欲深入檢視的個股：", stock_options, index=0)
+        selected_code = selected_stock_label.split()[0]
+        selected_name = selected_stock_label.split()[1] if len(selected_stock_label.split()) > 1 else ""
+
+        target_stock_df = range_summary_df[range_summary_df["代號"] == selected_code]
+
+        # 1. 全部官股合計走勢圖
+        total_stock_df = target_stock_df[target_stock_df["官股分點"] == "全部官股合計"].sort_values("交易日期")
+        if total_stock_df.empty:
+            total_stock_df = target_stock_df.groupby("交易日期", as_index=False)["買賣超張數"].sum().sort_values("交易日期")
+
+        if not total_stock_df.empty:
+            st.markdown(f"**【{selected_code} {selected_name}】 全部官股合計每日買賣超走勢：**")
+            tot_colors = ["#E74C3C" if v >= 0 else "#2ECC71" for v in total_stock_df["買賣超張數"]]
+            fig_total = go.Figure(data=[
+                go.Bar(
+                    x=total_stock_df["交易日期"],
+                    y=total_stock_df["買賣超張數"],
+                    marker_color=tot_colors,
+                    hovertemplate="日期: %{x}<br>合計買賣超: %{y}張<extra></extra>"
+                )
+            ])
+            fig_total.update_layout(
+                title=dict(text="<b>全部官股合計</b>", font=dict(size=14)),
+                height=260,
+                margin=dict(l=20, r=10, t=35, b=25),
+                xaxis=dict(type="category", showticklabels=True, tickfont=dict(size=9)),
+                yaxis=dict(title="張數", title_font=dict(size=10), tickfont=dict(size=9)),
+                showlegend=False
+            )
+            st.plotly_chart(fig_total, use_container_width=True)
+
+        # 2. 排除合計後的 5 大主力實體分點每日走勢圖
+        specific_branch_df = target_stock_df[target_stock_df["官股分點"] != "全部官股合計"]
+        if not specific_branch_df.empty:
+            branch_activity = specific_branch_df.groupby("官股分點")["買賣超張數"].apply(lambda s: s.abs().sum()).sort_values(ascending=False)
+            top_5_branches = branch_activity.head(5).index.tolist()
+
+            st.markdown(f"**【{selected_code} {selected_name}】 區間內最大買賣超 5 大實體分點每日走勢圖：**")
+            chart_cols = st.columns(min(len(top_5_branches), 3)) if top_5_branches else []
+
+            for i, branch_name in enumerate(top_5_branches):
+                col_target = chart_cols[i % len(chart_cols)]
+                b_df = specific_branch_df[specific_branch_df["官股分點"] == branch_name].sort_values("交易日期")
+                colors = ["#E74C3C" if v >= 0 else "#2ECC71" for v in b_df["買賣超張數"]]
+                fig_branch = go.Figure(data=[
+                    go.Bar(
+                        x=b_df["交易日期"],
+                        y=b_df["買賣超張數"],
+                        marker_color=colors,
+                        hovertemplate="日期: %{x}<br>買賣超: %{y}張<extra></extra>"
+                    )
+                ])
+                fig_branch.update_layout(
+                    title=dict(text=f"<b>{branch_name}</b>", font=dict(size=13)),
+                    height=240,
+                    margin=dict(l=20, r=10, t=35, b=25),
+                    xaxis=dict(type="category", showticklabels=True, tickfont=dict(size=9)),
+                    yaxis=dict(title="張數", title_font=dict(size=10), tickfont=dict(size=9)),
+                    showlegend=False
+                )
+                with col_target:
+                    st.plotly_chart(fig_branch, use_container_width=True)
+        else:
+            st.info("所選期間之各實體券商分點明細尚在陸續回補入庫中，目前先提供官股合計總覽圖。")
+    else:
+        st.info("所選區間無買賣超非 0 之個股資料可供繪製柱狀圖。")
